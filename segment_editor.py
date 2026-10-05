@@ -19,28 +19,65 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Callable, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import tkinter as tk
 import customtkinter as ctk
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ImageDraw
 
 from ffmpeg_utils import find_binary, get_base_dir
 
-def _init_fonts() -> str:
-    chosen = "Segoe UI"
-    if sys.platform.startswith("win"):
-        try:
-            import ctypes
-            fonts_dir = get_base_dir() / "assets" / "fonts"
-            if fonts_dir.is_dir():
-                for f in fonts_dir.glob("*.ttf"):
+try:
+    ctk.DrawEngine.preferred_drawing_method = "polygon_shapes"
+except Exception:
+    pass
+
+
+def apply_inter_to_tk_fonts(family: Optional[str] = None, root: Optional[tk.Misc] = None):
+    """Configures all default Tkinter named fonts to use the specified font family."""
+    fam = family or "Inter"
+    try:
+        import tkinter.font as tkfont
+        for name in [
+            "TkDefaultFont", "TkTextFont", "TkFixedFont", "TkMenuFont",
+            "TkHeadingFont", "TkCaptionFont", "TkSmallCaptionFont",
+            "TkIconFont", "TkTooltipFont"
+        ]:
+            try:
+                tkfont.nametofont(name, root=root).configure(family=fam)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _init_fonts(font_override: Optional[str] = None) -> str:
+    chosen = font_override or "Inter"
+    fonts_added = False
+    try:
+        fonts_dir = get_base_dir() / "assets" / "fonts"
+        if fonts_dir.is_dir():
+            for f in fonts_dir.glob("*.ttf"):
+                try:
+                    ctk.FontManager.load_font(str(f))
+                except Exception:
+                    pass
+                if sys.platform.startswith("win"):
                     try:
-                        ctypes.windll.gdi32.AddFontResourceExW(str(f), 0x10, 0)
+                        import ctypes
+                        res = ctypes.windll.gdi32.AddFontResourceExW(str(f), 0x10, 0)
+                        if res > 0:
+                            fonts_added = True
                     except Exception:
                         pass
-        except Exception:
-            pass
+        if sys.platform.startswith("win") and fonts_added:
+            try:
+                import ctypes
+                ctypes.windll.user32.SendMessageW(0xFFFF, 0x001D, 0, 0)  # WM_FONTCHANGE
+            except Exception:
+                pass
+    except Exception:
+        pass
     try:
         import tkinter.font as tkfont
         temp = None
@@ -48,18 +85,21 @@ def _init_fonts() -> str:
             temp = tk.Tk()
             temp.withdraw()
         fams = set(tkfont.families())
-        for pref in ["Poppins", "Montserrat", "Segoe UI Variable Text", "Segoe UI"]:
-            if pref in fams:
+        pref_list = [font_override] if font_override else []
+        pref_list.extend(["Inter", "Segoe UI Variable Text", "Segoe UI", "Poppins", "Montserrat"])
+        for pref in pref_list:
+            if pref and pref in fams:
                 chosen = pref
                 break
         if temp:
             temp.destroy()
     except Exception:
-        chosen = "Poppins" if sys.platform.startswith("win") else "Segoe UI"
+        chosen = "Inter" if sys.platform.startswith("win") else "Segoe UI"
     try:
         ctk.ThemeManager.theme["CTkFont"]["family"] = chosen
     except Exception:
         pass
+    apply_inter_to_tk_fonts(chosen)
     return chosen
 
 APP_FONT = _init_fonts()
@@ -77,7 +117,7 @@ BG_WIN       = _c("#F0F2F5", "#0F1013")
 BG_CARD      = _c("#FFFFFF", "#181920")
 BG_ROW       = _c("#F8F9FA", "#141519")
 BG_ROW_SEL   = _c("#FFF7ED", "#24170E")
-BD_ROW       = _c("#E2E4E8", "#232530")
+BD_ROW       = _c("#CBD5E1", "#333338")
 BD_ROW_SEL   = "#FF6D00"
 ORANGE       = "#FF6D00"
 ORANGE_HV    = "#E66200"
@@ -94,7 +134,7 @@ BG_PLAYER    = "#0B0C10"
 BG_WIN_T     = ("#F0F2F5", "#0F1013")
 BG_CARD_T    = ("#FFFFFF", "#181920")
 BG_INNER_T   = ("#F8F9FA", "#141519")
-BD_CARD_T    = ("#E2E4E8", "#232530")
+BD_CARD_T    = ("#CBD5E1", "#333338")
 BD_ACT_T     = ("#FF6D00", "#FF6D00")
 TXT_TITLE_T  = ("#111827", "#F9FAFB")
 TXT_BODY_T   = ("#4B5563", "#9CA3AF")
@@ -109,7 +149,7 @@ BADGE_FG_T   = ("#D97706", "#FBBF24")
 PREV_W = 448
 PREV_H = 252
 PLAY_FPS = 18          # Snímky za sekundu (notebook-friendly)
-DISP_MS  = 50          # Display timer interval (~20 Hz) - volný pro UI
+DISP_MS  = 25          # Display timer interval (~40 Hz) - plynulý náhled bez trhání
 
 # ---------------------------------------------------------------------------
 # Canvas seznam - geometrie jednoho řádku
@@ -177,12 +217,26 @@ def _grab_frame(video_path: Path, ts: float, w: int = PREV_W, h: int = PREV_H) -
     return None
 
 
-def _load_ctk_icon(name: str, size: Tuple[int, int] = (16, 16)) -> Optional[ctk.CTkImage]:
-    """Loads a PNG icon from assets/icons/ as CTkImage."""
+def _load_ctk_icon(name: str, size: Tuple[int, int] = (20, 20)) -> Optional[ctk.CTkImage]:
+    """Loads a PNG icon from assets/icons/ as CTkImage with automatic optical trimming and centering."""
     icon_path = Path(__file__).parent / "assets" / "icons" / f"{name}.png"
     if icon_path.is_file():
         try:
             im = Image.open(icon_path)
+            bbox = im.getbbox()
+            if bbox:
+                bw, bh = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                max_dim = max(bw, bh)
+                cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
+                pad = max_dim * 0.10
+                half = (max_dim / 2) + pad
+                crop_box = (
+                    max(0, int(cx - half)),
+                    max(0, int(cy - half)),
+                    min(im.width, int(cx + half)),
+                    min(im.height, int(cy + half)),
+                )
+                im = im.crop(crop_box)
             return ctk.CTkImage(light_image=im, dark_image=im, size=size)
         except Exception:
             pass
@@ -190,73 +244,214 @@ def _load_ctk_icon(name: str, size: Tuple[int, int] = (16, 16)) -> Optional[ctk.
 
 
 # ---------------------------------------------------------------------------
-# Modern Circular Check Indicator (Replaces harsh square checkboxes)
+# Modern Anti-Aliased Checkbox (Identical to Facecam AI)
 # ---------------------------------------------------------------------------
 
-class ModernCheckCircle(tk.Canvas):
+class ModernCheckBox(ctk.CTkFrame):
     """
-    Sleek circular check toggle for moment selection:
-    - Active: smooth circle filled with signature ORANGE (#FF6D00) with crisp white checkmark '✓'
-    - Inactive: clean subtle border ring matching the row aesthetic with orange hover ring
+    Pixel-perfect, anti-aliased modern rounded checkbox matching Facecam AI.
+    Features 4x supersampling with Lanczos downscaling, signature orange fill,
+    crisp checkmark, full-frame clickability, and hover states.
     """
+    _icon_cache: Dict[int, Dict[str, ctk.CTkImage]] = {}
+
+    @classmethod
+    def _get_icons(cls, size: int = 22) -> Dict[str, ctk.CTkImage]:
+        if size in cls._icon_cache:
+            return cls._icon_cache[size]
+
+        scale = 4
+        s = size * scale
+        r = int(5.5 * scale)
+        bw = int(1.8 * scale)
+
+        def make_box(fill, outline, is_checked=False, bg=(30, 32, 43)):
+            img = Image.new("RGBA", (s, s), (*bg, 255))
+            d = ImageDraw.Draw(img)
+            if outline:
+                d.rounded_rectangle(
+                    [bw // 2, bw // 2, s - 1 - bw // 2, s - 1 - bw // 2],
+                    radius=r,
+                    fill=fill,
+                    outline=outline,
+                    width=bw
+                )
+            else:
+                d.rounded_rectangle([0, 0, s - 1, s - 1], radius=r, fill=fill)
+            if is_checked:
+                cw = int(2.4 * scale)
+                p1 = (s * 0.27, s * 0.50)
+                p2 = (s * 0.44, s * 0.69)
+                p3 = (s * 0.74, s * 0.31)
+                d.line([p1, p2, p3], fill=(255, 255, 255, 255), width=cw, joint="curve")
+            return img.resize((size, size), Image.Resampling.LANCZOS)
+
+        bg_d = (30, 32, 43)
+        bg_l = (255, 255, 255)
+
+        u_dark = make_box((28, 30, 39, 255), (66, 72, 92, 255), bg=bg_d)
+        u_dark_h = make_box((35, 38, 50, 255), (255, 109, 0, 255), bg=bg_d)
+        u_light = make_box((255, 255, 255, 255), (203, 213, 225, 255), bg=bg_l)
+        u_light_h = make_box((248, 250, 252, 255), (255, 109, 0, 255), bg=bg_l)
+
+        c_dark = make_box((255, 109, 0, 255), None, is_checked=True, bg=bg_d)
+        c_dark_h = make_box((255, 133, 40, 255), None, is_checked=True, bg=bg_d)
+        c_light = make_box((255, 109, 0, 255), None, is_checked=True, bg=bg_l)
+        c_light_h = make_box((255, 133, 40, 255), None, is_checked=True, bg=bg_l)
+
+        icons = {
+            "unchecked": ctk.CTkImage(light_image=u_light, dark_image=u_dark, size=(size, size)),
+            "unchecked_hover": ctk.CTkImage(light_image=u_light_h, dark_image=u_dark_h, size=(size, size)),
+            "checked": ctk.CTkImage(light_image=c_light, dark_image=c_dark, size=(size, size)),
+            "checked_hover": ctk.CTkImage(light_image=c_light_h, dark_image=c_dark_h, size=(size, size))
+        }
+        cls._icon_cache[size] = icons
+        return icons
+
     def __init__(
         self,
         parent,
+        text: str = "",
         checked: bool = True,
-        command: Optional[Callable[[bool], None]] = None,
-        bg_color: str = "#141519",
-        sel_bg_color: str = "#24170E"
+        variable: Optional[Any] = None,
+        command: Optional[Callable] = None,
+        size: int = 22,
+        bg_color: Optional[str] = None,
+        sel_bg_color: Optional[str] = None,
+        **kwargs
     ):
-        super().__init__(parent, width=24, height=24, bg=bg_color, highlightthickness=0, cursor="hand2")
-        self.checked = checked
+        super().__init__(parent, fg_color="transparent", cursor="hand2")
+        self.variable = variable if variable is not None else ctk.BooleanVar(value=checked)
+        if variable is not None and checked is not None:
+            self.variable.set(checked)
         self.command = command
+        self._size = size
+        self._icons = self._get_icons(size)
+        self._hovered = False
+        self._state = kwargs.get("state", "normal")
         self.bg_color = bg_color
         self.sel_bg_color = sel_bg_color
         self.is_selected = False
-        self.draw()
-        self.bind("<Button-1>", self._on_click)
-        self.bind("<Enter>", self._on_enter)
-        self.bind("<Leave>", self._on_leave)
+
+        self._box_lbl = ctk.CTkLabel(
+            self,
+            text="",
+            image=self._get_current_image(),
+            width=size,
+            height=size,
+            cursor="hand2"
+        )
+        self._box_lbl.pack(side="left", padx=0)
+
+        if text:
+            self._text_lbl = ctk.CTkLabel(
+                self,
+                text=text,
+                anchor="w",
+                cursor="hand2"
+            )
+            self._text_lbl.pack(side="left", padx=(8, 0))
+            self._text_lbl.bind("<Button-1>", self._on_click)
+            self._text_lbl.bind("<Enter>", self._on_enter)
+            self._text_lbl.bind("<Leave>", self._on_leave)
+
+        for w in (self, self._box_lbl):
+            w.bind("<Button-1>", self._on_click, add="+")
+            w.bind("<Enter>", self._on_enter, add="+")
+            w.bind("<Leave>", self._on_leave, add="+")
+
+        if hasattr(self.variable, "trace_add"):
+            self._trace_id = self.variable.trace_add("write", lambda *_: self._update_image())
+        elif hasattr(self.variable, "trace"):
+            self._trace_id = self.variable.trace("w", lambda *_: self._update_image())
+
+    def bind(self, sequence=None, command=None, add="+"):
+        effective_add = "+" if (add is None or add is True) else add
+        res = super().bind(sequence, command, add=effective_add)
+        if sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            if hasattr(self, "_box_lbl"):
+                try:
+                    self._box_lbl.bind(sequence, command, add=effective_add)
+                except Exception:
+                    pass
+            if hasattr(self, "_text_lbl"):
+                try:
+                    self._text_lbl.bind(sequence, command, add=effective_add)
+                except Exception:
+                    pass
+        return res
+
+    @property
+    def checked(self) -> bool:
+        return bool(self.variable.get())
+
+    @checked.setter
+    def checked(self, value: bool):
+        self.set(value)
+
+    def set_checked(self, value: bool):
+        self.set(value)
 
     def draw(self, is_selected: Optional[bool] = None):
         if is_selected is not None:
             self.is_selected = is_selected
-        self.delete("all")
-        cur_bg = self.sel_bg_color if self.is_selected else self.bg_color
-        self.configure(bg=cur_bg)
-        if self.checked:
-            self.create_oval(3, 3, 21, 21, fill=ORANGE, outline=ORANGE)
-            self.create_line(7.5, 12.0, 10.5, 15.0, fill="#FFFFFF", width=2, capstyle="round", joinstyle="round")
-            self.create_line(10.5, 15.0, 16.5, 9.0, fill="#FFFFFF", width=2, capstyle="round", joinstyle="round")
-        else:
-            bd = "#4B5563" if ctk.get_appearance_mode().lower() == "dark" else "#94A3B8"
-            self.create_oval(3, 3, 21, 21, fill=cur_bg, outline=bd, width=1.5)
-
-    def _on_enter(self, event=None):
-        if not self.checked:
-            self.delete("all")
-            cur_bg = self.sel_bg_color if self.is_selected else self.bg_color
-            self.configure(bg=cur_bg)
-            self.create_oval(3, 3, 21, 21, fill=cur_bg, outline=ORANGE, width=1.5)
-
-    def _on_leave(self, event=None):
-        self.draw()
-
-    def set_checked(self, checked: bool):
-        self.checked = checked
-        self.draw()
 
     def set_colors(self, bg_color: str, sel_bg_color: str):
         self.bg_color = bg_color
         self.sel_bg_color = sel_bg_color
-        self.draw()
+
+    def _get_current_image(self) -> ctk.CTkImage:
+        val = bool(self.variable.get()) if self.variable else False
+        if val:
+            return self._icons["checked_hover"] if self._hovered else self._icons["checked"]
+        else:
+            return self._icons["unchecked_hover"] if self._hovered else self._icons["unchecked"]
+
+    def _update_image(self):
+        if hasattr(self, "_box_lbl") and self._box_lbl.winfo_exists():
+            self._box_lbl.configure(image=self._get_current_image())
+
+    def _on_enter(self, event=None):
+        if self._state == "disabled":
+            return
+        self._hovered = True
+        self._update_image()
+
+    def _on_leave(self, event=None):
+        self._hovered = False
+        self._update_image()
 
     def _on_click(self, event=None):
-        self.checked = not self.checked
-        self.draw()
+        if self._state == "disabled":
+            return "break"
+        new_val = not bool(self.variable.get())
+        self.variable.set(new_val)
+        self._update_image()
         if callable(self.command):
-            self.command(self.checked)
+            try:
+                self.command(new_val)
+            except TypeError:
+                self.command()
         return "break"
+
+    def get(self) -> bool:
+        return bool(self.variable.get())
+
+    def set(self, value: bool):
+        self.variable.set(bool(value))
+        self._update_image()
+
+    def select(self):
+        self.set(True)
+
+    def deselect(self):
+        self.set(False)
+
+    def toggle(self):
+        self._on_click()
+
+
+ModernCheckCircle = ModernCheckBox
 
 
 # ===========================================================================
@@ -308,7 +503,7 @@ class LargePreviewDialog(ctk.CTkToplevel):
         self.title(title)
         self.geometry("1020x710")
         self.minsize(980, 680)
-        self.configure(fg_color=BG_CARD_T)
+        self.configure(fg_color=BG_WIN_T)
         self.transient(parent)
         self.grab_set()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -320,9 +515,11 @@ class LargePreviewDialog(ctk.CTkToplevel):
         self.bind("<Right>", lambda _: self._seek_relative(2.0))
 
         # Ikony
-        self._icon_play = _load_ctk_icon("play", (15, 15))
-        self._icon_pause = _load_ctk_icon("pause", (15, 15))
-        self._icon_check = _load_ctk_icon("check", (15, 15))
+        self._icon_play = _load_ctk_icon("play", (22, 22))
+        self._icon_pause = _load_ctk_icon("pause", (22, 22))
+        self._icon_check = _load_ctk_icon("check", (20, 20))
+        self._icon_reload = _load_ctk_icon("reload", (20, 20))
+        self._icon_close = _load_ctk_icon("close", (18, 18))
 
         # Stav přehrávače
         self._playing = False
@@ -350,11 +547,21 @@ class LargePreviewDialog(ctk.CTkToplevel):
         try:
             self.update_idletasks()
             w, h = 1020, 710
+            sw = self.winfo_screenwidth()
+            sh = self.winfo_screenheight()
             px = self._parent.winfo_x()
             py = self._parent.winfo_y()
             pw = self._parent.winfo_width()
             ph = self._parent.winfo_height()
-            self.geometry(f"{w}x{h}+{px + max(0, (pw - w) // 2)}+{py + max(0, (ph - h) // 2)}")
+            if pw > 100 and ph > 100:
+                cx = px + pw // 2
+                cy = py + ph // 2
+                x = max(10, min(sw - w - 10, cx - w // 2))
+                y = max(10, min(sh - h - 10, cy - h // 2))
+            else:
+                x = max(10, (sw - w) // 2)
+                y = max(10, (sh - h) // 2)
+            self.geometry(f"{w}x{h}+{x}+{y}")
         except Exception:
             pass
 
@@ -402,10 +609,12 @@ class LargePreviewDialog(ctk.CTkToplevel):
         # Tlačítko zavřít
         btn_close = ctk.CTkButton(
             hdr,
-            text="✕  Zavřít (Esc)" if self.lang == "cs" else "✕  Close (Esc)",
+            text="  Zavřít (Esc)" if self.lang == "cs" else "  Close (Esc)",
+            image=self._icon_close,
+            compound="left",
             command=self._on_close,
             height=32,
-            width=110,
+            width=120,
             font=ctk.CTkFont(size=11, weight="bold"),
             fg_color=BG_INNER_T,
             hover_color=("#E5E7EB", "#252834"),
@@ -420,7 +629,7 @@ class LargePreviewDialog(ctk.CTkToplevel):
         cframe = ctk.CTkFrame(
             self,
             fg_color=BG_PLAYER,
-            corner_radius=10,
+            corner_radius=12,
             border_width=1,
             border_color=BD_CARD_T,
         )
@@ -482,7 +691,9 @@ class LargePreviewDialog(ctk.CTkToplevel):
         # Replay
         self._btn_replay = ctk.CTkButton(
             ctrl,
-            text="↺  Znovu" if self.lang == "cs" else "↺  Replay",
+            text="Znovu" if self.lang == "cs" else "Replay",
+            image=self._icon_reload,
+            compound="left",
             command=self._restart_play,
             height=38,
             width=100,
@@ -499,9 +710,7 @@ class LargePreviewDialog(ctk.CTkToplevel):
         # Zahrnutí do výsledného videa
         self._btn_inc = ctk.CTkButton(
             ctrl,
-            text="✓  Zahrnuto do videa" if self.lang == "cs" else "✓  Included in Cut",
-            image=self._icon_check,
-            compound="left",
+            text="",
             command=self._toggle_inc,
             height=38,
             font=ctk.CTkFont(size=12, weight="bold"),
@@ -522,9 +731,11 @@ class LargePreviewDialog(ctk.CTkToplevel):
 
     def _update_inc_btn(self):
         if self.is_included:
-            t = "✓  Zahrnuto do výsledného videa" if self.lang == "cs" else "✓  Included in Cut"
+            t = "Zahrnuto do výsledného videa" if self.lang == "cs" else "Included in Cut"
             self._btn_inc.configure(
                 text=t,
+                image=self._icon_check,
+                compound="left",
                 fg_color=("#ECFDF5", "#062E1E"),
                 hover_color=("#D1FAE5", "#0F4733"),
                 text_color=("#059669", "#34D399"),
@@ -532,14 +743,16 @@ class LargePreviewDialog(ctk.CTkToplevel):
                 border_color=("#10B981", "#059669"),
             )
         else:
-            t = "✕  Vynecháno z videa" if self.lang == "cs" else "✕  Excluded from Cut"
+            t = "  Vyřazeno ze sestřihu" if self.lang == "cs" else "  Excluded from Cut"
             self._btn_inc.configure(
                 text=t,
-                fg_color=("#F3F4F6", "#1E2028"),
-                hover_color=("#E5E7EB", "#252834"),
-                text_color=("#9CA3AF", "#6B7280"),
+                image=self._icon_close,
+                compound="left",
+                fg_color=("#FEF2F2", "#261316"),
+                hover_color=("#FEE2E2", "#3B1B20"),
+                text_color=("#DC2626", "#F87171"),
                 border_width=1,
-                border_color=("#D1D5DB", "#374151"),
+                border_color=("#F87171", "#DC2626"),
             )
 
     def _toggle_inc(self):
@@ -696,10 +909,11 @@ class LargePreviewDialog(ctk.CTkToplevel):
             sinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             sinfo.wShowWindow = 0
 
-        # Audio stream
+        audio_t0 = time.monotonic()
+        # Audio stream (audio-only decode without video overhead for zero buffer delay)
         self._aud_proc = subprocess.Popen(
             [
-                str(ffplay), "-nodisp",
+                str(ffplay), "-nodisp", "-vn", "-sn", "-fast",
                 "-ss", f"{resume_start:.3f}", "-t", f"{resume_dur:.3f}",
                 "-autoexit", str(self.video_path),
             ],
@@ -709,13 +923,15 @@ class LargePreviewDialog(ctk.CTkToplevel):
             creationflags=cflags,
         )
 
-        # Video stream
+        # Video stream with multithreaded fast scaling
         self._vid_proc = subprocess.Popen(
             [
                 str(ffmpeg),
                 "-ss", f"{resume_start:.3f}", "-t", f"{resume_dur:.3f}",
+                "-threads", "2",
+                "-flags2", "+fast",
                 "-i", str(self.video_path),
-                "-vf", f"scale={LARGE_PREV_W}:{LARGE_PREV_H},fps={LARGE_PLAY_FPS}",
+                "-vf", f"scale={LARGE_PREV_W}:{LARGE_PREV_H}:flags=fast_bilinear,fps={LARGE_PLAY_FPS}",
                 "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
             ],
             stdout=subprocess.PIPE,
@@ -725,13 +941,15 @@ class LargePreviewDialog(ctk.CTkToplevel):
         )
 
         base_offset = self._cur_play_offset
-        threading.Thread(target=self._reader, args=(curr_session, base_offset), daemon=True).start()
+        threading.Thread(target=self._reader, args=(curr_session, base_offset, audio_t0), daemon=True).start()
         self._disp_id = self.after(LARGE_DISP_MS, self._disp_tick)
 
-    def _reader(self, session_id: int, base_offset: float = 0.0):
+    def _reader(self, session_id: int, base_offset: float = 0.0, audio_t0: float = 0.0):
         fsize = LARGE_PREV_W * LARGE_PREV_H * 3
         fi = 0
-        wall0 = time.monotonic()
+        frame_dur = 1.0 / LARGE_PLAY_FPS
+        audio_hw_latency = 0.08 if sys.platform.startswith("win") else 0.02
+        clock_start = (audio_t0 if audio_t0 > 0 else time.monotonic()) + audio_hw_latency
 
         try:
             while not self._stop_ev.is_set() and session_id == self._play_session_id:
@@ -742,7 +960,30 @@ class LargePreviewDialog(ctk.CTkToplevel):
                     break
 
                 fi += 1
-                ft = base_offset + (fi / LARGE_PLAY_FPS)
+                now = time.monotonic()
+                audio_elapsed = max(0.0, now - clock_start)
+                frame_pts = fi * frame_dur
+                time_diff = frame_pts - audio_elapsed
+
+                # Hard framedrop: skip behind frames immediately to match audio clock
+                if time_diff < -frame_dur:
+                    frames_behind = int((-time_diff) / frame_dur)
+                    if frames_behind > 0:
+                        bytes_to_skip = min(frames_behind, 30) * fsize
+                        discarded = self._vid_proc.stdout.read(bytes_to_skip)
+                        skipped_actual = len(discarded) // fsize
+                        fi += skipped_actual
+                        if skipped_actual > 0:
+                            raw = self._vid_proc.stdout.read(fsize)
+                            if len(raw) < fsize:
+                                break
+                            fi += 1
+                            now = time.monotonic()
+                            audio_elapsed = max(0.0, now - clock_start)
+                            frame_pts = fi * frame_dur
+                            time_diff = frame_pts - audio_elapsed
+
+                ft = base_offset + (fi * frame_dur)
 
                 try:
                     img = Image.frombytes("RGB", (LARGE_PREV_W, LARGE_PREV_H), raw)
@@ -752,10 +993,8 @@ class LargePreviewDialog(ctk.CTkToplevel):
                 with self._frame_lock:
                     self._next_frame = (img, ft)
 
-                target = wall0 + (fi / LARGE_PLAY_FPS)
-                wait = target - time.monotonic()
-                if wait > 0.003:
-                    time.sleep(wait)
+                if time_diff > 0.002:
+                    time.sleep(time_diff)
         except Exception:
             pass
         finally:
@@ -865,16 +1104,22 @@ class SegmentReviewDialog(ctk.CTkToplevel):
         # Canvas seznam - stav scrollu
         self._list_canvas: Optional[tk.Canvas] = None
         self._row_items: List[dict] = []  # canvas item IDs pro každý řádek
-        self._chk_widgets: List[ModernCheckCircle] = []
+        self._chk_widgets: List[ModernCheckBox] = []
         self._chk_windows: List[int] = []  # canvas window IDs pro checkboxy
 
         # Ikony pro ovládací prvky přehrávače
-        self._icon_play = _load_ctk_icon("play", (14, 14))
-        self._icon_pause = _load_ctk_icon("pause", (14, 14))
-        self._icon_stop = _load_ctk_icon("stop", (14, 14))
-        self._icon_expand = _load_ctk_icon("expand", (14, 14))
-        self._icon_check = _load_ctk_icon("check", (15, 15))
-        self._icon_plus = _load_ctk_icon("plus", (15, 15))
+        self._icon_play = _load_ctk_icon("play", (22, 22))
+        self._icon_pause = _load_ctk_icon("pause", (22, 22))
+        self._icon_stop = _load_ctk_icon("stop", (20, 20))
+        self._icon_expand = _load_ctk_icon("expand", (20, 20))
+        self._icon_check = _load_ctk_icon("check", (20, 20))
+        self._icon_plus = _load_ctk_icon("plus", (20, 20))
+        self._icon_trash = _load_ctk_icon("trash", (20, 20))
+        self._icon_star = _load_ctk_icon("star", (20, 20))
+        self._icon_play_row = _load_ctk_icon("play", (15, 15))
+        self._icon_volume = _load_ctk_icon("volume", (18, 18))
+        self._icon_facecam = _load_ctk_icon("facecam", (18, 18))
+        self._icon_close = _load_ctk_icon("close", (18, 18))
 
         # Okno
         title = ("SnapCut • Editor"
@@ -882,7 +1127,8 @@ class SegmentReviewDialog(ctk.CTkToplevel):
         self.title(title)
         self.geometry("1140x760")
         self.minsize(1060, 680)
-        self.configure(fg_color=BG_CARD_T)
+        self.configure(fg_color=BG_WIN_T)
+        apply_inter_to_tk_fonts(APP_FONT, root=self)
         self.transient(parent)
         self.grab_set()
         self.protocol("WM_DELETE_WINDOW", self._on_cancel)
@@ -910,8 +1156,13 @@ class SegmentReviewDialog(ctk.CTkToplevel):
         self.c_bg_card = "#181920" if self.is_dark else "#FFFFFF"
         self.c_bg_row = "#141519" if self.is_dark else "#F8F9FA"
         self.c_bg_row_sel = "#24170E" if self.is_dark else "#FFF7ED"
-        self.c_bd_row = "#232530" if self.is_dark else "#E2E4E8"
+        self.c_bd_row = "#333338" if self.is_dark else "#CBD5E1"
         self.c_bd_row_sel = ORANGE
+
+        self.c_stat_inc_bg = "#062E1E" if self.is_dark else "#ECFDF5"
+        self.c_stat_inc_fg = "#34D399" if self.is_dark else "#059669"
+        self.c_stat_exc_bg = "#261316" if self.is_dark else "#FEF2F2"
+        self.c_stat_exc_fg = "#F87171" if self.is_dark else "#DC2626"
 
         self.c_txt_main = "#F9FAFB" if self.is_dark else "#111827"
         self.c_txt_body = "#9CA3AF" if self.is_dark else "#4B5563"
@@ -1020,9 +1271,19 @@ class SegmentReviewDialog(ctk.CTkToplevel):
         self.update_idletasks()
         try:
             w, h = 1140, 760
+            sw = self.winfo_screenwidth()
+            sh = self.winfo_screenheight()
             px, py = self._parent.winfo_x(), self._parent.winfo_y()
             pw, ph = self._parent.winfo_width(), self._parent.winfo_height()
-            self.geometry(f"{w}x{h}+{px + max(0, (pw-w)//2)}+{py + max(0, (ph-h)//2)}")
+            if pw > 100 and ph > 100:
+                cx = px + pw // 2
+                cy = py + ph // 2
+                x = max(10, min(sw - w - 10, cx - w // 2))
+                y = max(10, min(sh - h - 10, cy - h // 2))
+            else:
+                x = max(10, (sw - w) // 2)
+                y = max(10, (sh - h) // 2)
+            self.geometry(f"{w}x{h}+{x}+{y}")
         except Exception:
             pass
 
@@ -1041,7 +1302,7 @@ class SegmentReviewDialog(ctk.CTkToplevel):
     # --- Hlavička ---
 
     def _build_header(self):
-        hdr = ctk.CTkFrame(self, corner_radius=10, fg_color=BG_CARD_T,
+        hdr = ctk.CTkFrame(self, corner_radius=12, fg_color=BG_CARD_T,
                            border_width=1, border_color=BD_CARD_T)
         hdr.pack(fill="x", padx=16, pady=(12, 8))
 
@@ -1146,15 +1407,23 @@ class SegmentReviewDialog(ctk.CTkToplevel):
             border_width=1, border_color=BD_CARD_T, corner_radius=8)
         self._btn_ext.pack(side="right")
 
+        # Akční tlačítko pro střih: Smazat moment
+        self._btn_del = ctk.CTkButton(
+            p, text="Smazat moment" if self.lang == "cs" else "Delete moment",
+            image=self._icon_trash, compound="left",
+            command=self._delete_selected_segment,
+            height=34, font=ctk.CTkFont(size=12, weight="bold"),
+            fg_color=("#FEF2F2", "#241416"), hover_color=("#FEE2E2", "#351B1F"),
+            text_color=("#DC2626", "#F87171"), border_width=1, border_color=("#FCA5A5", "#5C1D24"),
+            corner_radius=8)
+        self._btn_del.pack(fill="x", pady=(0, 6))
+
         # Velké tlačítko zahrnutí/vynechání
         self._btn_inc = ctk.CTkButton(
-            p, text="✓  Zahrnuto do výsledného videa" if self.lang == "cs" else "✓  Included in Cut",
-            image=self._icon_check, compound="left",
+            p, text="",
             command=self._toggle_inc,
-            height=36, font=ctk.CTkFont(size=12, weight="bold"),
-            fg_color=("#ECFDF5", "#062E1E"), hover_color=("#D1FAE5", "#0F4733"),
-            text_color=("#059669", "#34D399"), border_width=1,
-            border_color=("#10B981", "#059669"), corner_radius=8)
+            height=38, font=ctk.CTkFont(size=12, weight="bold"),
+            corner_radius=8)
         self._btn_inc.pack(fill="x", pady=(0, 8))
 
         # Info box – elegantní strukturované metriky momentu
@@ -1166,7 +1435,9 @@ class SegmentReviewDialog(ctk.CTkToplevel):
         ibi.pack(fill="both", expand=True, padx=10, pady=8)
 
         self._lbl_loud = ctk.CTkLabel(
-            ibi, text="🔊  Hlasitost špičky: -",
+            ibi, text="  Hlasitost špičky: -",
+            image=self._icon_volume,
+            compound="left",
             font=ctk.CTkFont(size=12, weight="bold"),
             text_color=TXT_TITLE_T,
             anchor="w"
@@ -1174,7 +1445,9 @@ class SegmentReviewDialog(ctk.CTkToplevel):
         self._lbl_loud.pack(fill="x", pady=(0, 4))
 
         self._lbl_face = ctk.CTkLabel(
-            ibi, text="😊  Detekce obličeje: N/A",
+            ibi, text="  Detekce obličeje: N/A",
+            image=self._icon_facecam,
+            compound="left",
             font=ctk.CTkFont(size=12),
             text_color=TXT_BODY_T,
             anchor="w"
@@ -1250,135 +1523,139 @@ class SegmentReviewDialog(ctk.CTkToplevel):
         self.bind("<Down>", lambda _: self._kb_nav(1))
 
     def _build_canvas_rows(self):
-        """Vytvoří moderní strukturované řádky momentů (rychlé nativní Tk komponenty s Logi estetikou)."""
-        font_num = (APP_FONT, 10, "bold")
-        font_time = (APP_FONT, 10, "bold")
-        font_chip = (APP_FONT, 9)
-        font_ai = (APP_FONT, 9, "bold")
-        font_pbtn = (APP_FONT, 10, "bold")
-
+        """Vytvoří moderní strukturované řádky momentů se zaoblenými kartami a dokonale vycentrovanými prvky."""
         for i, seg in enumerate(self.segs):
             start, end = seg[0], seg[1]
             dur = max(0.1, end - start)
             peak = seg[2] if len(seg) >= 3 else -14.0
             is_rec = (round(start, 2), round(end, 2)) in self._rec_set
+            is_inc = self._inc[i]
 
-            # Řádkový frame (tk.Frame = nativní, bez CTk overhead)
-            row_f = tk.Frame(
+            # Řádkový frame (CTkFrame pro elegantní zaoblené rohy a čistý obrys)
+            row_f = ctk.CTkFrame(
                 self._inner_frame,
-                bg=self.c_bg_row,
-                bd=0,
-                highlightbackground=self.c_bd_row,
-                highlightthickness=1,
+                corner_radius=10,
+                fg_color=self.c_bg_row,
+                border_width=1,
+                border_color=self.c_bd_row,
                 height=ROW_H
             )
-            row_f.pack(fill="x", padx=6, pady=2)
+            row_f.pack(fill="x", padx=6, pady=3)
             row_f.pack_propagate(False)
 
-            inner = tk.Frame(row_f, bg=self.c_bg_row)
-            inner.pack(fill="both", expand=True, padx=4, pady=3)
-
-            # 1. Left accent bar indicator (oranžový pruh při aktivním výběru)
-            ind = tk.Frame(inner, width=3, bg=self.c_bg_row)
-            ind.pack(side="left", fill="y", padx=(2, 6), pady=6)
-
-            # 2. Moderní elegantní kruhový indikátor výběru
-            chk = ModernCheckCircle(
-                inner,
-                checked=self._inc[i],
+            # 1. Moderní elegantní zaoblený checkbox výběru (Facecam AI styl, 4x anti-aliasing)
+            chk = ModernCheckBox(
+                row_f,
+                checked=is_inc,
                 command=lambda c, idx=i: self._on_chk(idx, c),
                 bg_color=self.c_bg_row,
-                sel_bg_color=self.c_bg_row_sel
+                sel_bg_color=self.c_bg_row_sel,
+                size=22
             )
-            chk.pack(side="left", padx=(0, 6))
+            chk.pack(side="left", padx=(10, 6))
             self._chk_widgets.append(chk)
 
-            # 3. Číslo momentu (#01, #02, ...)
-            lbl_num = tk.Label(
-                inner,
+            # 2. Číslo momentu (#01, #02, ...)
+            lbl_num = ctk.CTkLabel(
+                row_f,
                 text=f"#{i+1:02d}",
-                bg=self.c_bg_row,
-                fg=self.c_txt_muted,
-                font=font_num,
-                width=4,
+                font=ctk.CTkFont(size=12, weight="bold"),
+                text_color=self.c_txt_main,
+                width=36,
                 anchor="w",
                 cursor="hand2"
             )
             lbl_num.pack(side="left", padx=(0, 6))
 
-            # 4. Časový rozsah se šipkou
-            lbl_time = tk.Label(
-                inner,
+            # 3. Časový rozsah se šipkou
+            lbl_time = ctk.CTkLabel(
+                row_f,
                 text=f"{fmt_t(start)}  →  {fmt_t(end)}",
-                bg=self.c_bg_row,
-                fg=self.c_txt_main,
-                font=font_time,
+                font=ctk.CTkFont(size=12, weight="bold"),
+                text_color=self.c_txt_main if is_inc else self.c_txt_muted,
                 anchor="w",
                 cursor="hand2"
             )
             lbl_time.pack(side="left", padx=(0, 8))
 
-            # 5. Délka v chipu
-            lbl_dur = tk.Label(
-                inner,
-                text=f" {dur:.1f}s ",
-                bg=self.c_chip_bg,
-                fg=self.c_txt_body,
-                font=font_chip,
-                relief="flat",
+            # 4. Délka v zaobleném chipu
+            lbl_dur = ctk.CTkLabel(
+                row_f,
+                text=f"{dur:.1f}s",
+                font=ctk.CTkFont(size=11),
+                text_color=self.c_txt_body,
+                fg_color=self.c_chip_bg,
+                corner_radius=6,
+                padx=8,
+                pady=2,
                 cursor="hand2"
             )
-            lbl_dur.pack(side="left", padx=(0, 6))
+            lbl_dur.pack(side="left", padx=(0, 5))
 
-            # 6. Špička hlasitosti v chipu
-            lbl_peak = tk.Label(
-                inner,
-                text=f" {peak:.1f} dB ",
-                bg=self.c_chip_bg,
-                fg=self.c_txt_muted,
-                font=font_chip,
-                relief="flat",
+            # 5. Špička hlasitosti v zaobleném chipu
+            lbl_peak = ctk.CTkLabel(
+                row_f,
+                text=f"{peak:.1f} dB",
+                font=ctk.CTkFont(size=11),
+                text_color=self.c_txt_muted,
+                fg_color=self.c_chip_bg,
+                corner_radius=6,
+                padx=8,
+                pady=2,
                 cursor="hand2"
             )
-            lbl_peak.pack(side="left", padx=(0, 6))
+            lbl_peak.pack(side="left", padx=(0, 5))
 
-            # 7. AI doporučení badge
+            # 6. AI doporučení badge
             lbl_ai = None
             if is_rec:
-                lbl_ai = tk.Label(
-                    inner,
-                    text=" ★ AI ",
-                    bg=self.c_badge_ai_bg,
-                    fg=self.c_badge_ai_fg,
-                    font=font_ai,
-                    relief="flat",
+                lbl_ai = ctk.CTkLabel(
+                    row_f,
+                    text="★ AI",
+                    font=ctk.CTkFont(size=11, weight="bold"),
+                    text_color=self.c_badge_ai_fg,
+                    fg_color=self.c_badge_ai_bg,
+                    corner_radius=6,
+                    padx=8,
+                    pady=2,
                     cursor="hand2"
                 )
-                lbl_ai.pack(side="left", padx=(0, 4))
+                lbl_ai.pack(side="left", padx=(0, 5))
 
-            # 8. Play preview tlačítko vpravo
-            pbtn = tk.Label(
-                inner,
-                text=" ▶ ",
-                bg=self.c_pbtn_bg,
-                fg=ORANGE,
-                font=font_pbtn,
-                relief="flat",
-                bd=0,
-                cursor="hand2",
+            # 7. Stav momentu (Zahrnuto do sestřihu vs Vyřazeno)
+            stat_text = "✓ V sestřihu" if (self.lang == "cs" and is_inc) else ("✓ In Cut" if is_inc else ("✕ Vyřazeno" if self.lang == "cs" else "✕ Excluded"))
+            stat_bg = self.c_stat_inc_bg if is_inc else self.c_stat_exc_bg
+            stat_fg = self.c_stat_inc_fg if is_inc else self.c_stat_exc_fg
+
+            lbl_stat = ctk.CTkLabel(
+                row_f,
+                text=stat_text,
+                font=ctk.CTkFont(size=11, weight="bold"),
+                text_color=stat_fg,
+                fg_color=stat_bg,
+                corner_radius=6,
                 padx=8,
-                pady=2
+                pady=2,
+                cursor="hand2"
             )
-            pbtn.pack(side="right", padx=(4, 2))
-            pbtn.bind("<Button-1>", lambda _, idx=i: self._sel_and_play(idx))
-            pbtn.bind("<Enter>", lambda _, b=pbtn: b.configure(bg=ORANGE, fg="#FFFFFF"))
-            pbtn.bind("<Leave>", lambda _, b=pbtn, idx=i: b.configure(
-                bg=self.c_pbtn_sel_bg if idx == self._sel else self.c_pbtn_bg,
-                fg=ORANGE
-            ))
+            lbl_stat.pack(side="left", padx=(0, 6))
+
+            # 8. Zaoblené a vycentrované tlačítko přehrání náhledu vpravo
+            pbtn = ctk.CTkButton(
+                row_f,
+                text="",
+                image=self._icon_play_row,
+                width=34,
+                height=28,
+                corner_radius=8,
+                fg_color=self.c_pbtn_bg,
+                hover_color=ORANGE,
+                command=lambda idx=i: self._sel_and_play(idx)
+            )
+            pbtn.pack(side="right", padx=(0, 8))
 
             # Kliknutí na řádek -> výběr
-            clickable = [row_f, inner, ind, lbl_num, lbl_time, lbl_dur, lbl_peak]
+            clickable = [row_f, lbl_num, lbl_time, lbl_dur, lbl_peak, lbl_stat]
             if lbl_ai:
                 clickable.append(lbl_ai)
             for w in clickable:
@@ -1387,50 +1664,116 @@ class SegmentReviewDialog(ctk.CTkToplevel):
                 w.bind("<MouseWheel>", self._on_wheel)
 
             self._row_items.append({
-                "frame": row_f, "inner": inner, "ind": ind,
-                "lbl_num": lbl_num, "lbl_time": lbl_time, "lbl_dur": lbl_dur,
-                "lbl_peak": lbl_peak, "lbl_ai": lbl_ai,
-                "chk": chk, "pbtn": pbtn
+                "frame": row_f, "lbl_num": lbl_num, "lbl_time": lbl_time,
+                "lbl_dur": lbl_dur, "lbl_peak": lbl_peak, "lbl_ai": lbl_ai,
+                "lbl_stat": lbl_stat, "chk": chk, "pbtn": pbtn
             })
 
     def _highlight_row(self, idx: int, selected: bool):
         if not (0 <= idx < len(self._row_items)):
             return
         row = self._row_items[idx]
+        is_inc = self._inc[idx] if idx < len(self._inc) else True
         bg = self.c_bg_row_sel if selected else self.c_bg_row
         bd = self.c_bd_row_sel if selected else self.c_bd_row
-        row["frame"].configure(bg=bg, highlightbackground=bd)
-        row["inner"].configure(bg=bg)
-        row["ind"].configure(bg=ORANGE if selected else bg)
-        row["lbl_num"].configure(bg=bg, fg=ORANGE if selected else self.c_txt_muted)
-        row["lbl_time"].configure(bg=bg)
+        row["frame"].configure(fg_color=bg, border_color=bd)
+        row["lbl_num"].configure(text_color=ORANGE if selected else self.c_txt_main)
+        time_color = self.c_txt_main if is_inc else self.c_txt_muted
+        row["lbl_time"].configure(text_color=time_color)
         row["chk"].draw(is_selected=selected)
         btn_bg = self.c_pbtn_sel_bg if selected else self.c_pbtn_bg
-        row["pbtn"].configure(bg=btn_bg, fg=ORANGE)
+        row["pbtn"].configure(fg_color=btn_bg)
+
+    def _update_row_stat(self, idx: int):
+        if not (0 <= idx < len(self._row_items)):
+            return
+        row = self._row_items[idx]
+        is_inc = self._inc[idx] if idx < len(self._inc) else True
+        stat_text = "✓ V sestřihu" if (self.lang == "cs" and is_inc) else ("✓ In Cut" if is_inc else ("✕ Vyřazeno" if self.lang == "cs" else "✕ Excluded"))
+        stat_bg = self.c_stat_inc_bg if is_inc else self.c_stat_exc_bg
+        stat_fg = self.c_stat_inc_fg if is_inc else self.c_stat_exc_fg
+        time_color = self.c_txt_main if is_inc else self.c_txt_muted
+
+        if "lbl_stat" in row and row["lbl_stat"]:
+            row["lbl_stat"].configure(text=stat_text, fg_color=stat_bg, text_color=stat_fg)
+        if "lbl_time" in row and row["lbl_time"]:
+            row["lbl_time"].configure(text_color=time_color)
+
+    def _rebuild_rows(self, keep_sel: int = 0):
+        """Přebuduje všechny řádky v seznamu po rozdělení nebo smazání segmentu."""
+        if not self._inner_frame:
+            return
+        for widget in self._inner_frame.winfo_children():
+            try:
+                widget.destroy()
+            except Exception:
+                pass
+        self._row_items.clear()
+        self._chk_widgets.clear()
+        self._chk_windows.clear()
+        self._build_canvas_rows()
+        if self._list_canvas and self._inner_frame:
+            self._list_canvas.update_idletasks()
+            self._list_canvas.configure(scrollregion=self._list_canvas.bbox("all"))
+        if self.segs:
+            new_sel = max(0, min(keep_sel, len(self.segs) - 1))
+            self._select(new_sel)
+        self._update_summary()
+
+
+    def _delete_selected_segment(self):
+        """Odstraní aktuálně vybraný moment ze seznamu."""
+        if not self.segs or not (0 <= self._sel < len(self.segs)):
+            return
+        if len(self.segs) <= 1:
+            if self._inc[self._sel]:
+                self._toggle_inc()
+            return
+
+        self._stop_play()
+        self._cur_play_offset = 0.0
+        del_idx = self._sel
+
+        self.segs.pop(del_idx)
+        if del_idx < len(self._inc):
+            self._inc.pop(del_idx)
+
+        new_sel = min(del_idx, len(self.segs) - 1)
+        self._sel = new_sel
+        self._rebuild_rows(keep_sel=new_sel)
 
     def _build_toolbar(self, parent):
         tb = ctk.CTkFrame(parent, fg_color="transparent")
         tb.pack(fill="x", padx=12, pady=(10, 6))
 
         def _b(txt, cmd, **kw):
-            return ctk.CTkButton(tb, text=txt, command=cmd, height=28,
-                                 font=ctk.CTkFont(size=11, weight="bold"),
-                                 border_width=1, corner_radius=6, **kw)
+            return ctk.CTkButton(tb, text=txt, command=cmd, height=30,
+                                 font=ctk.CTkFont(size=12, weight="bold"),
+                                 border_width=1, corner_radius=8, **kw)
 
-        t_ai = "★ AI výběr" if self.lang == "cs" else "★ AI Picks"
+        t_ai = "AI výběr" if self.lang == "cs" else "AI Picks"
         _b(t_ai, self._reset_ai,
+           image=self._icon_star, compound="left",
            fg_color=BADGE_BG_T, hover_color=("#FDE68A", "#3D3016"),
            text_color=BADGE_FG_T, border_color=("#F59E0B", "#B45309")
            ).pack(side="left", padx=(0, 6))
 
-        _b("✓ Vše" if self.lang == "cs" else "✓ All", self._sel_all,
+        _b("Vše" if self.lang == "cs" else "All", self._sel_all,
+           image=self._icon_check, compound="left",
            fg_color=BG_INNER_T, hover_color=("#E5E7EB", "#252834"),
            text_color=TXT_TITLE_T, border_color=BD_CARD_T
            ).pack(side="left", padx=(0, 6))
 
-        _b("✕ Nic" if self.lang == "cs" else "✕ None", self._desel_all,
+        _b("Nic" if self.lang == "cs" else "None", self._desel_all,
+           image=self._icon_close, compound="left",
            fg_color=BG_INNER_T, hover_color=("#E5E7EB", "#252834"),
            text_color=TXT_TITLE_T, border_color=BD_CARD_T
+           ).pack(side="left", padx=(0, 10))
+
+        _b("Smazat" if self.lang == "cs" else "Delete", self._delete_selected_segment,
+           image=self._icon_trash, compound="left",
+           fg_color=("#FEF2F2", "#241416"), hover_color=("#FEE2E2", "#351B1F"),
+           text_color=("#DC2626", "#F87171"), border_color=("#FCA5A5", "#5C1D24")
            ).pack(side="left")
 
         if self.target_dur and self.target_dur > 0:
@@ -1514,18 +1857,18 @@ class SegmentReviewDialog(ctk.CTkToplevel):
 
         self._update_inc_btn(self._inc[idx])
 
-        self._lbl_loud.configure(text=f"🔊  Hlasitost špičky: {peak:.1f} dBFS")
-        fc = (f"😊  Facecam reakce: {int(face*100)}%" if face > 0.05
-              else ("Facecam: Bez reakce" if self.lang == "cs"
-                    else "Facecam: No reaction"))
-        self._lbl_face.configure(text=fc)
+        self._lbl_loud.configure(image=self._icon_volume, compound="left", text=f"  Hlasitost špičky: {peak:.1f} dBFS")
+        fc = (f"  Facecam reakce: {int(face*100)}%" if face > 0.05
+              else ("  Facecam: Bez reakce" if self.lang == "cs"
+                    else "  Facecam: No reaction"))
+        self._lbl_face.configure(image=self._icon_facecam, compound="left", text=fc)
 
         if is_rec:
-            ai = "★  AI doporučení pro cílovou délku" if self.lang == "cs" else "★  AI recommended pick"
-            self._lbl_ai.configure(text=ai, text_color=BADGE_FG_T)
+            ai = "  AI doporučení pro cílovou délku" if self.lang == "cs" else "  AI recommended pick"
+            self._lbl_ai.configure(image=self._icon_star, compound="left", text=ai, text_color=BADGE_FG_T)
         else:
-            ai = "○  Doplňkový moment (volitelné)" if self.lang == "cs" else "○  Optional moment"
-            self._lbl_ai.configure(text=ai, text_color=TXT_MUTED_T)
+            ai = "Doplňkový moment (volitelné)" if self.lang == "cs" else "Optional moment"
+            self._lbl_ai.configure(image=None, text=ai, text_color=TXT_MUTED_T)
 
         # Načti náhledový snímek v bg threadu (s unikátním ID požadavku)
         self._still_req_id += 1
@@ -1696,35 +2039,40 @@ class SegmentReviewDialog(ctk.CTkToplevel):
             sinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             sinfo.wShowWindow = 0
 
-        # Audio: ffplay od navázané pozice
+        audio_t0 = time.monotonic()
+        # Audio: ffplay od navázané pozice (čisté audio bez dekódování videa pro nulový buffer delay)
         self._aud_proc = subprocess.Popen(
-            [str(ffplay), "-nodisp",
+            [str(ffplay), "-nodisp", "-vn", "-sn", "-fast",
              "-ss", f"{resume_start:.3f}", "-t", f"{resume_dur:.3f}",
              "-autoexit", str(self.video_path)],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             startupinfo=sinfo, creationflags=cflags)
 
-        # Video: ffmpeg raw RGB pipe od navázané pozice
+        # Video: ffmpeg raw RGB pipe s multithreaded fast-bilinear scalerem
         self._vid_proc = subprocess.Popen(
             [str(ffmpeg),
              "-ss", f"{resume_start:.3f}", "-t", f"{resume_dur:.3f}",
+             "-threads", "2",
+             "-flags2", "+fast",
              "-i", str(self.video_path),
-             "-vf", f"scale={PREV_W}:{PREV_H},fps={PLAY_FPS}",
+             "-vf", f"scale={PREV_W}:{PREV_H}:flags=fast_bilinear,fps={PLAY_FPS}",
              "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             startupinfo=sinfo, creationflags=cflags)
 
-        # Reader thread s počátečním offsetem a session ID
+        # Reader thread s počátečním offsetem, session ID a audio_t0
         base_offset = self._cur_play_offset
-        threading.Thread(target=self._reader, args=(curr_session, base_offset), daemon=True).start()
+        threading.Thread(target=self._reader, args=(curr_session, base_offset, audio_t0), daemon=True).start()
         # Display timer
         self._disp_id = self.after(DISP_MS, self._disp_tick)
 
-    def _reader(self, session_id: int, base_offset: float = 0.0):
-        """Čte snímky z ffmpeg jako čisté PIL Images v bg threadu (žádný PhotoImage v threadu!)."""
+    def _reader(self, session_id: int, base_offset: float = 0.0, audio_t0: float = 0.0):
+        """Čte snímky z ffmpeg s pevnou synchronizací na audio clock a okamžitým framedropem."""
         fsize = PREV_W * PREV_H * 3
         fi = 0
-        wall0 = time.monotonic()
+        frame_dur = 1.0 / PLAY_FPS
+        audio_hw_latency = 0.08 if sys.platform.startswith("win") else 0.02
+        clock_start = (audio_t0 if audio_t0 > 0 else time.monotonic()) + audio_hw_latency
 
         try:
             while not self._stop_ev.is_set() and session_id == self._play_session_id:
@@ -1735,7 +2083,30 @@ class SegmentReviewDialog(ctk.CTkToplevel):
                     break
 
                 fi += 1
-                ft = base_offset + (fi / PLAY_FPS)
+                now = time.monotonic()
+                audio_elapsed = max(0.0, now - clock_start)
+                frame_pts = fi * frame_dur
+                time_diff = frame_pts - audio_elapsed
+
+                # Hard framedrop: pokud video zaostává za audiem, ihned zahoď zpožděné snímky z roury
+                if time_diff < -frame_dur:
+                    frames_behind = int((-time_diff) / frame_dur)
+                    if frames_behind > 0:
+                        bytes_to_skip = min(frames_behind, 30) * fsize
+                        discarded = self._vid_proc.stdout.read(bytes_to_skip)
+                        skipped_actual = len(discarded) // fsize
+                        fi += skipped_actual
+                        if skipped_actual > 0:
+                            raw = self._vid_proc.stdout.read(fsize)
+                            if len(raw) < fsize:
+                                break
+                            fi += 1
+                            now = time.monotonic()
+                            audio_elapsed = max(0.0, now - clock_start)
+                            frame_pts = fi * frame_dur
+                            time_diff = frame_pts - audio_elapsed
+
+                ft = base_offset + (fi * frame_dur)
 
                 try:
                     img = Image.frombytes("RGB", (PREV_W, PREV_H), raw)
@@ -1745,11 +2116,8 @@ class SegmentReviewDialog(ctk.CTkToplevel):
                 with self._frame_lock:
                     self._next_frame = (img, ft)
 
-                # Pacing - čekej na správný čas
-                target = wall0 + (fi / PLAY_FPS)
-                wait = target - time.monotonic()
-                if wait > 0.003:
-                    time.sleep(wait)
+                if time_diff > 0.002:
+                    time.sleep(time_diff)
 
         except Exception:
             pass
@@ -1877,6 +2245,7 @@ class SegmentReviewDialog(ctk.CTkToplevel):
             self._inc[idx] = state
             if idx < len(self._chk_widgets):
                 self._chk_widgets[idx].set_checked(state)
+            self._update_row_stat(idx)
             if idx == self._sel:
                 self._update_inc_btn(state)
             self._update_summary()
@@ -1894,12 +2263,13 @@ class SegmentReviewDialog(ctk.CTkToplevel):
             self._inc[idx] = not self._inc[idx]
             if idx < len(self._chk_widgets):
                 self._chk_widgets[idx].set_checked(self._inc[idx])
+            self._update_row_stat(idx)
             self._update_inc_btn(self._inc[idx])
             self._update_summary()
 
     def _update_inc_btn(self, inc: bool):
         if inc:
-            t = "✓  Zahrnuto do výsledného videa" if self.lang == "cs" else "✓  Included in Cut"
+            t = "Zahrnuto do výsledného videa" if self.lang == "cs" else "Included in Cut"
             self._btn_inc.configure(
                 text=t,
                 image=self._icon_check,
@@ -1911,15 +2281,14 @@ class SegmentReviewDialog(ctk.CTkToplevel):
                 border_width=1
             )
         else:
-            t = "+  Vynecháno (kliknutím zahrnout)" if self.lang == "cs" else "+  Excluded (click to include)"
+            t = "✕  Vyřazeno ze sestřihu" if self.lang == "cs" else "✕  Excluded from Cut"
             self._btn_inc.configure(
                 text=t,
-                image=self._icon_plus,
-                compound="left",
-                fg_color=BG_INNER_T,
-                hover_color=("#E5E7EB", "#252834"),
-                text_color=TXT_MUTED_T,
-                border_color=BD_CARD_T,
+                image=None,
+                fg_color=("#FEF2F2", "#261316"),
+                hover_color=("#FEE2E2", "#3B1B20"),
+                text_color=("#DC2626", "#F87171"),
+                border_color=("#F87171", "#DC2626"),
                 border_width=1
             )
 
@@ -1928,21 +2297,24 @@ class SegmentReviewDialog(ctk.CTkToplevel):
             self._inc[idx] = checked
         elif 0 <= idx < len(self._chk_widgets):
             self._inc[idx] = self._chk_widgets[idx].checked
+        self._update_row_stat(idx)
         if idx == self._sel:
             self._update_inc_btn(self._inc[idx])
         self._update_summary()
 
     def _sel_all(self):
         self._inc = [True] * len(self._inc)
-        for w in self._chk_widgets:
+        for i, w in enumerate(self._chk_widgets):
             w.set_checked(True)
+            self._update_row_stat(i)
         self._update_inc_btn(True)
         self._update_summary()
 
     def _desel_all(self):
         self._inc = [False] * len(self._inc)
-        for w in self._chk_widgets:
+        for i, w in enumerate(self._chk_widgets):
             w.set_checked(False)
+            self._update_row_stat(i)
         self._update_inc_btn(False)
         self._update_summary()
 
@@ -1952,6 +2324,7 @@ class SegmentReviewDialog(ctk.CTkToplevel):
             self._inc[i] = val
             if i < len(self._chk_widgets):
                 self._chk_widgets[i].set_checked(val)
+            self._update_row_stat(i)
         self._update_inc_btn(self._inc[self._sel] if self.segs else False)
         self._update_summary()
 

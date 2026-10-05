@@ -31,12 +31,12 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import tkinter as tk
 from tkinter import filedialog, messagebox
 import customtkinter as ctk
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 
 def safe_ask_directory(
@@ -133,32 +133,153 @@ def safe_ask_open_file(
 
     return result or ""
 
-def init_custom_fonts() -> str:
-    """
-    Registers bundled fonts (Poppins) on Windows using AddFontResourceExW
-    and configures CustomTkinter's default font family.
-    Returns the chosen font family name.
-    """
-    chosen = "Segoe UI"
-    if sys.platform.startswith("win"):
+# Use circle_shapes for smooth, continuous rounded corners without pixelated polygon bevels
+try:
+    ctk.DrawEngine.preferred_drawing_method = "circle_shapes"
+except Exception:
+    pass
+
+
+def load_app_icon(name: str, size: Tuple[int, int] = (20, 20), tint: Optional[str] = None) -> Optional[ctk.CTkImage]:
+    """Loads a PNG icon from assets/icons/ as CTkImage with automatic optical trimming and centering."""
+    icon_path = Path(__file__).resolve().parent / "assets" / "icons" / f"{name}.png"
+    if icon_path.is_file():
         try:
-            import ctypes
-            base_candidates = [
-                Path(__file__).resolve().parent,
-                Path(sys.executable).parent,
-            ]
-            if hasattr(sys, "_MEIPASS"):
-                base_candidates.insert(0, Path(getattr(sys, "_MEIPASS")))
-            for b in base_candidates:
-                fonts_dir = b / "assets" / "fonts"
-                if fonts_dir.is_dir():
-                    for font_path in fonts_dir.glob("*.ttf"):
-                        try:
-                            ctypes.windll.gdi32.AddFontResourceExW(str(font_path), 0x10, 0)
-                        except Exception:
-                            pass
+            im = Image.open(icon_path).convert("RGBA")
+            if tint == "white":
+                r, g, b, a = im.split()
+                im = Image.merge("RGBA", (Image.new("L", im.size, 255), Image.new("L", im.size, 255), Image.new("L", im.size, 255), a))
+            bbox = im.getbbox()
+            if bbox:
+                bw, bh = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                max_dim = max(bw, bh)
+                cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
+                pad = max_dim * 0.08
+                half = (max_dim / 2) + pad
+                crop_box = (
+                    int(cx - half),
+                    int(cy - half),
+                    int(cx + half),
+                    int(cy + half),
+                )
+                w_sq = crop_box[2] - crop_box[0]
+                h_sq = crop_box[3] - crop_box[1]
+                sq_im = Image.new("RGBA", (w_sq, h_sq), (0, 0, 0, 0))
+                sq_im.paste(im, (-crop_box[0], -crop_box[1]))
+                im = sq_im
+            return ctk.CTkImage(light_image=im, dark_image=im, size=size)
         except Exception:
             pass
+    return None
+
+
+
+def apply_font_to_tk_fonts(family: str = "Poppins", root: Optional[tk.Misc] = None):
+    """Configures all default Tkinter named fonts to use the specified font family."""
+    try:
+        import tkinter.font as tkfont
+        for name in [
+            "TkDefaultFont", "TkTextFont", "TkFixedFont", "TkMenuFont",
+            "TkHeadingFont", "TkCaptionFont", "TkSmallCaptionFont",
+            "TkIconFont", "TkTooltipFont"
+        ]:
+            try:
+                tkfont.nametofont(name, root=root).configure(family=family)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+# Backward compatibility alias
+apply_inter_to_tk_fonts = apply_font_to_tk_fonts
+
+
+def init_custom_fonts(font_override: Optional[str] = None) -> str:
+    """
+    Registers bundled Inter and Poppins fonts directly on Windows using AddFontResourceExW,
+    broadcasts WM_FONTCHANGE, and configures CustomTkinter and Tkinter default font family.
+    Returns the chosen font family name.
+    """
+    chosen = font_override or "Inter"
+    try:
+        base_candidates = [
+            Path(__file__).resolve().parent,
+            Path(sys.executable).parent,
+        ]
+        if hasattr(sys, "_MEIPASS"):
+            base_candidates.insert(0, Path(getattr(sys, "_MEIPASS")))
+        fonts_dir = None
+        for b in base_candidates:
+            candidate = b / "assets" / "fonts"
+            if candidate.is_dir():
+                fonts_dir = candidate
+                break
+        if not fonts_dir:
+            fonts_dir = Path(__file__).resolve().parent / "assets" / "fonts"
+            fonts_dir.mkdir(parents=True, exist_ok=True)
+
+        required_fonts = [
+            "Inter-Medium.ttf", "Inter-Bold.ttf", "Inter-Regular.ttf", "Inter-SemiBold.ttf",
+            "Poppins-Medium.ttf", "Poppins-Bold.ttf", "Poppins-Regular.ttf", "Poppins-SemiBold.ttf"
+        ]
+        missing = [f for f in required_fonts if not (fonts_dir / f).exists()]
+        if missing:
+            try:
+                import urllib.request, zipfile, io
+                req = urllib.request.Request(
+                    "https://github.com/rsms/inter/releases/download/v4.1/Inter-4.1.zip",
+                    headers={"User-Agent": "Mozilla/5.0"}
+                )
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    zdata = resp.read()
+                    with zipfile.ZipFile(io.BytesIO(zdata)) as z:
+                        for m in missing:
+                            zip_entry = f"extras/ttf/{m}"
+                            if zip_entry in z.namelist():
+                                (fonts_dir / m).write_bytes(z.read(zip_entry))
+            except Exception:
+                pass
+
+        fonts_added = False
+        for font_name in required_fonts:
+            fp = fonts_dir / font_name
+            if fp.is_file():
+                try:
+                    ctk.FontManager.load_font(str(fp.resolve()))
+                except Exception:
+                    pass
+                if sys.platform.startswith("win"):
+                    try:
+                        import ctypes
+                        res = ctypes.windll.gdi32.AddFontResourceExW(str(fp.resolve()), 0x10, 0)
+                        if res > 0:
+                            fonts_added = True
+                    except Exception:
+                        pass
+
+        if fonts_dir.is_dir():
+            for fp in fonts_dir.glob("*.ttf"):
+                try:
+                    ctk.FontManager.load_font(str(fp.resolve()))
+                except Exception:
+                    pass
+                if sys.platform.startswith("win"):
+                    try:
+                        import ctypes
+                        res = ctypes.windll.gdi32.AddFontResourceExW(str(fp.resolve()), 0x10, 0)
+                        if res > 0:
+                            fonts_added = True
+                    except Exception:
+                        pass
+
+        if sys.platform.startswith("win") and fonts_added:
+            try:
+                import ctypes
+                ctypes.windll.user32.SendMessageW(0xFFFF, 0x001D, 0, 0)  # WM_FONTCHANGE
+            except Exception:
+                pass
+    except Exception:
+        pass
 
     try:
         import tkinter.font as tkfont
@@ -167,19 +288,22 @@ def init_custom_fonts() -> str:
             temp_root = tk.Tk()
             temp_root.withdraw()
         fams = set(tkfont.families())
-        for preferred in ["Poppins", "Montserrat", "Segoe UI Variable Text", "Segoe UI Variable Display", "Segoe UI"]:
-            if preferred in fams:
+        pref_list = [font_override] if font_override else []
+        pref_list.extend(["Inter", "Segoe UI Variable Text", "Segoe UI", "Poppins", "Montserrat"])
+        for preferred in pref_list:
+            if preferred and preferred in fams:
                 chosen = preferred
                 break
         if temp_root:
             temp_root.destroy()
     except Exception:
-        chosen = "Poppins" if sys.platform.startswith("win") else "Segoe UI"
+        chosen = "Inter" if sys.platform.startswith("win") else "Segoe UI"
 
     try:
         ctk.ThemeManager.theme["CTkFont"]["family"] = chosen
     except Exception:
         pass
+    apply_font_to_tk_fonts(chosen)
     return chosen
 
 APP_FONT_FAMILY = init_custom_fonts()
@@ -208,7 +332,7 @@ from video_cutter import (
 )
 from segment_editor import SegmentReviewDialog
 
-APP_VERSION = "1.0.0-beta"
+APP_VERSION = "1.1.0"
 
 # -----------------------------------------------------------------------------
 # Configuration Management & Defaults (Bulletproof persistence)
@@ -246,7 +370,7 @@ CONFIG_FILE = get_config_file_path()
 DEFAULT_CONFIG = {
     "language": "cs",
     "theme": "dark",
-    "font_family": "Poppins",
+    "font_family": "Inter",
     "default_export_dir": "",
     "auto_open_folder": True,
     "detection_mode": "highlights", # "highlights" or "silence"
@@ -436,7 +560,7 @@ TRANSLATIONS = {
 
         # PeciCut Section 3: Detection Parameters
         "sec_params_title": "3. Režim detekce a parametry střihu",
-        "mode_highlights": "Akcni highlighty (výkřiky, smích, hlasité momenty)",
+        "mode_highlights": "Akční highlighty (výkřiky, smích, hlasité momenty)",
         "mode_nosilence": "Celý stream bez hluchých míst (odstranění ticha)",
         "lbl_target_dur_title": "Cílová maximální délka sestřihu:",
         "lbl_threshold": "Práh hlasitosti / řevu (dBFS):",
@@ -653,26 +777,30 @@ TRANSLATIONS = {
 }
 
 # -----------------------------------------------------------------------------
-# Logi Options+ Inspired Creator Theme Colors (Light / Dark Adaptive Tuples)
+# Logi Options+ & High-End Creator Studio Theme Colors (Multi-Tonal Dark Palette)
 # -----------------------------------------------------------------------------
-BG_WINDOW = ("#F8F9FA", "#0F1013")          # Pozadí okna (čistá světlá šedá / hluboká matná Logi tmavá)
-BG_HEADER = ("#FFFFFF", "#141519")          # Hlavička a postranní panel
-BG_CARD = ("#FFFFFF", "#181920")            # Karty sekcí (čistá bílá / matná Logi grafitová)
-BG_CARD_INNER = ("#F3F4F6", "#13141A")      # Vnitřní vnořené zóny a panely
-BORDER_CARD = ("#E5E7EB", "#232530")        # Jemné 1px ohraničení karet
-BORDER_SUBTLE = ("#E2E8F0", "#2D303E")      # Ohraničení tlačítek a přepínačů
+BG_WINDOW = ("#F4F6F9", "#0B0C10")          # Hluboké obsidianové pozadí okna
+BG_HEADER = ("#FFFFFF", "#10121A")          # Záhlaví a horní panel
+BG_SIDEBAR = ("#FFFFFF", "#0D0E14")         # Postranní panel modulu
+BG_CARD = ("#FFFFFF", "#14161F")            # Základní karta sekce
+BG_CARD_ALT = ("#FFFFFF", "#161824")        # Alternativní odstín pro vstupní/exportní karty
+BG_CARD_INNER = ("#F1F5F9", "#1A1D28")      # Vnitřní vnořené zóny a panely
+BORDER_CARD = ("#E2E8F0", "#242736")        # Hladké, přirozeně zaoblené ohraničení bez pixelace
+BORDER_SUBTLE = ("#E2E8F0", "#1E212E")      # Jemné linky a vnitřní oddělovače
 
 ORANGE_PRIMARY = "#FF6D00"                  # Výrazná tvůrčí oranžová (Logi Options+ signature accent)
 ORANGE_HOVER = "#FF7E1A"                    # Zářivější hover oranžová
 ORANGE_ACTIVE = "#E65A00"                   # Aktivní kliknutí
-ORANGE_SUBTLE = ("#FFEDD5", "#26170E")      # Jemné podbarvení odznaků a pill tagů
-ORANGE_ACCENT_TEXT = ("#C2410C", "#FF8C26") # Oranžový text hodnot s vysokým kontrastem
+ORANGE_SUBTLE = ("#FFF7ED", "#26150B")      # Tmavě jantarové podbarvení odznaků a pill tagů
+ORANGE_ACCENT_TEXT = ("#C2410C", "#FFA04D") # Oranžový text hodnot s vysokým kontrastem
+CHIP_BG = ("#F1F5F9", "#1B1E29")            # Digitální čipy hodnot
+CHIP_BORDER = ("#E2E8F0", "#282C3D")        # Rámeček čipů
 
-TEXT_TITLE = ("#111827", "#F9FAFB")         # Čistý kontrastní nadpis
-TEXT_BODY = ("#4B5563", "#A1A1AA")          # Přehledný sekundární text (Logi neutrální šedá)
-TEXT_MUTED = ("#6B7280", "#71717A")         # Tlumené popisky a pomocné texty
+TEXT_TITLE = ("#0F172A", "#F8FAFC")         # Čistý kontrastní nadpis
+TEXT_BODY = ("#475569", "#94A3B8")          # Přehledný sekundární text (Slate)
+TEXT_MUTED = ("#64748B", "#64748B")         # Tlumené popisky a pomocné texty
 TEXT_REC = ("#C25E00", "#FF9933")           # Zlatavá oranžová pro doporučení
-TRACK_COLOR = ("#E5E7EB", "#242632")        # Moderní dráha posuvníků
+TRACK_COLOR = ("#94A3B8", "#2D3346")        # Moderní dráha posuvníků
 
 # -----------------------------------------------------------------------------
 # Logi Options+ Studio Theme Preview Window Generator
@@ -785,6 +913,8 @@ class ModernTooltip:
         self.tip_window: Optional[ctk.CTkToplevel] = None
         self.after_id = None
         self.hide_after_id = None
+        self._root_binds: List[Tuple[Any, str, str]] = []
+        self._heartbeat_id: Optional[str] = None
 
         targets = [self.widget]
         try:
@@ -797,9 +927,9 @@ class ModernTooltip:
             targets.append(self.widget._text_label)
 
         for w in targets:
-            w.bind("<Enter>", self.on_enter, add=True)
-            w.bind("<Leave>", self.on_leave, add=True)
-            w.bind("<Button-1>", self.on_click, add=True)
+            w.bind("<Enter>", self.on_enter, add="+")
+            w.bind("<Leave>", self.on_leave, add="+")
+            w.bind("<Button-1>", self.on_click, add="+")
 
     def set_recommendation(self, recommendation: Optional[str]):
         """Dynamically update recommendation text (e.g. when changing mode)."""
@@ -840,9 +970,14 @@ class ModernTooltip:
         ModernTooltip.active_tooltip = self
 
         self.tip_window = tw = ctk.CTkToplevel(self.widget)
-        tw.wm_overrideredirect(True)
+        root = self.widget.winfo_toplevel()
         try:
-            tw.attributes("-topmost", True)
+            tw.transient(root)
+        except Exception:
+            pass
+        tw.wm_overrideredirect(True)
+        tw.lift()
+        try:
             if sys.platform.startswith("win"):
                 tw.attributes("-transparentcolor", "#000001")
                 tw.configure(fg_color="#000001")
@@ -853,10 +988,10 @@ class ModernTooltip:
 
         card = ctk.CTkFrame(
             tw,
-            corner_radius=14,
+            corner_radius=12,
             border_width=1,
-            border_color=ORANGE_PRIMARY,
-            fg_color=BG_CARD
+            border_color=("#E2E8F0", "#313547"),
+            fg_color=("#FFFFFF", "#1E202C")
         )
         card.pack(padx=2, pady=2)
 
@@ -928,19 +1063,22 @@ class ModernTooltip:
             rec_card = ctk.CTkFrame(
                 inner,
                 corner_radius=8,
-                fg_color=("#FFF7ED", "#26170E"),
+                fg_color=("#FFF7ED", "#231B16"),
                 border_width=1,
-                border_color=("#FED7AA", "#45220A")
+                border_color=("#FED7AA", "#3D2A1C")
             )
             rec_card.pack(fill="x", pady=(6, 0))
             hover_targets.append(rec_card)
 
             rec_text = self.recommendation
+            icon_bulb = load_app_icon("lightbulb", size=(16, 16))
             lbl_rec = ctk.CTkLabel(
                 rec_card,
-                text=f"💡  Doporučení: {rec_text}",
+                text=f"  Doporučení: {rec_text}",
+                image=icon_bulb,
+                compound="left",
                 font=ctk.CTkFont(size=11, weight="bold"),
-                text_color=ORANGE_PRIMARY,
+                text_color=("#EA580C", "#FB923C"),
                 wraplength=self.max_width - 24,
                 justify="left"
             )
@@ -951,8 +1089,8 @@ class ModernTooltip:
             self.cancel_schedule()
 
         for widget_item in hover_targets:
-            widget_item.bind("<Enter>", keep_open, add=True)
-            widget_item.bind("<Leave>", self.on_leave, add=True)
+            widget_item.bind("<Enter>", keep_open, add="+")
+            widget_item.bind("<Leave>", self.on_leave, add="+")
 
         tw.update_idletasks()
         w_tip = tw.winfo_width()
@@ -974,8 +1112,30 @@ class ModernTooltip:
 
         tw.wm_geometry(f"+{x}+{y}")
 
+        # Root dismiss listeners
+        self._root_binds = []
+        try:
+            for seq in ("<Button-1>", "<Button-2>", "<Button-3>", "<Deactivate>", "<Unmap>", "<MouseWheel>"):
+                bid = root.bind(seq, lambda _: self.hide(), add="+")
+                self._root_binds.append((root, seq, bid))
+        except Exception:
+            pass
+
     def hide(self):
         self.cancel_schedule()
+        if hasattr(self, "_heartbeat_id") and self._heartbeat_id:
+            try:
+                self.widget.after_cancel(self._heartbeat_id)
+            except Exception:
+                pass
+            self._heartbeat_id = None
+        if hasattr(self, "_root_binds"):
+            for target, seq, bid in self._root_binds:
+                try:
+                    target.unbind(seq, bid)
+                except Exception:
+                    pass
+            self._root_binds.clear()
         if self.tip_window:
             try:
                 self.tip_window.destroy()
@@ -992,14 +1152,102 @@ class ModernTooltip:
 
 
 # -----------------------------------------------------------------------------
+# Color Resolution and Anti-Aliased Graphics Helpers
+# -----------------------------------------------------------------------------
+
+def _resolve_color(col: Any) -> Optional[str]:
+    """Resolves CustomTkinter color tuple (light, dark) or single color based on active appearance mode."""
+    if col is None:
+        return None
+    if isinstance(col, (tuple, list)):
+        mode = ctk.get_appearance_mode()
+        val = col[0] if mode == "Light" else col[1]
+    else:
+        val = col
+    if val == "transparent":
+        return None
+    return str(val)
+
+
+def _hex_to_rgb(hex_str: str) -> Tuple[int, int, int]:
+    """Converts a 6-character hex color string to an (R, G, B) tuple."""
+    c = hex_str.strip().lstrip("#")
+    if len(c) == 3:
+        c = "".join([x * 2 for x in c])
+    if len(c) == 6:
+        try:
+            return (int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16))
+        except ValueError:
+            pass
+    return (15, 16, 22)
+
+
+def _get_widget_bg_rgb(widget) -> Tuple[int, int, int]:
+    """
+    Walks up the widget hierarchy starting from the parent to find the first
+    non-transparent background color. Returns an (R, G, B) tuple used as the
+    canvas background when rendering PIL rounded widgets, so anti-aliased corner
+    pixels blend seamlessly into the parent container instead of showing gray/dark artifacts.
+    """
+    try:
+        w = getattr(widget, "master", None)
+        for _ in range(14):
+            if w is None:
+                break
+            try:
+                fg = w.cget("fg_color")
+                if fg and fg not in ("transparent", "", None):
+                    resolved = _resolve_color(fg)
+                    if resolved and resolved != "transparent":
+                        return _hex_to_rgb(resolved)
+            except Exception:
+                pass
+            try:
+                w = getattr(w, "master", None)
+            except Exception:
+                break
+    except Exception:
+        pass
+    if ctk.get_appearance_mode() == "Light":
+        return (246, 247, 250)
+    return (15, 16, 22)
+
+
+def _color_to_rgba(col: Any, alpha: int = 255) -> Tuple[int, int, int, int]:
+    """Converts a hex color string, color name, or tuple into an RGBA integer 4-tuple."""
+    if not col or col == "transparent":
+        return (0, 0, 0, 0)
+    resolved = _resolve_color(col)
+    if not resolved:
+        return (0, 0, 0, 0)
+    if isinstance(resolved, (tuple, list)) and len(resolved) in (3, 4):
+        return tuple(resolved) if len(resolved) == 4 else (*resolved, alpha)  # type: ignore
+    c = str(resolved).strip().lstrip("#")
+    if len(c) == 3:
+        c = "".join([x * 2 for x in c])
+    if len(c) == 6:
+        try:
+            return (int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16), alpha)
+        except ValueError:
+            pass
+    if len(c) == 8:
+        try:
+            return (int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16), int(c[6:8], 16))
+        except ValueError:
+            pass
+    return (255, 255, 255, alpha)
+
+
+# -----------------------------------------------------------------------------
 # Modern Floating Rounded Option Menu (Replaces ancient Windows 95 tk.Menu)
 # -----------------------------------------------------------------------------
 
-class ModernOptionMenu(ctk.CTkFrame):
+class ModernOptionMenu(ctk.CTkLabel):
     """
     Sleek modern dropdown replacement for CTkOptionMenu.
-    Replaces ugly native Windows 95 tk.Menu with a floating rounded card,
-    smooth hover highlights, active item indicators, and Poppins typography.
+    Renders an ultra-smooth, 4x supersampled anti-aliased rounded card trigger with
+    subtle 1px border, Inter typography, and floating rounded popup menu.
+    Eliminates all jagged staircases and pixelated edges on Windows.
     """
     active_menu: Optional['ModernOptionMenu'] = None
 
@@ -1010,7 +1258,7 @@ class ModernOptionMenu(ctk.CTkFrame):
         variable: Optional[ctk.StringVar] = None,
         command: Optional[Callable[[str], None]] = None,
         width: int = 400,
-        height: int = 36,
+        height: int = 38,
         fg_color: Optional[Tuple[str, str]] = None,
         text_color: Optional[Tuple[str, str]] = None,
         button_color: Optional[str] = None,
@@ -1018,22 +1266,23 @@ class ModernOptionMenu(ctk.CTkFrame):
         dynamic_resizing: bool = False,
         **kwargs
     ):
-        card_fg = fg_color or ("#F3F4F6", "#20222B")
-        txt_c = text_color or TEXT_TITLE
         super().__init__(
             parent,
+            text="",
             width=width,
             height=height,
-            corner_radius=10,
-            fg_color=card_fg,
-            border_width=1,
-            border_color=BORDER_CARD,
+            fg_color="transparent",
+            corner_radius=0,
             cursor="hand2"
         )
-        self.pack_propagate(False)
         self.values = list(values) if values else []
         self.command = command
         self.variable = variable
+        self._target_w = width
+        self._height = height
+        self._current_w = width
+        self._fg_color = fg_color or ("#FFFFFF", "#1E202B")
+        self._text_color = text_color or TEXT_TITLE
         self._state = "normal"
         self._current_value = ""
         if variable and variable.get():
@@ -1042,96 +1291,162 @@ class ModernOptionMenu(ctk.CTkFrame):
             self._current_value = self.values[0]
 
         self._popup: Optional[ctk.CTkToplevel] = None
+        self._hovered = False
+        self._bound_handlers: List[Tuple[Any, str, str]] = []
+        self._heartbeat_id: Optional[str] = None
 
-        # Content row inside button
-        self._btn_frame = ctk.CTkFrame(self, fg_color="transparent", cursor="hand2")
-        self._btn_frame.pack(fill="both", expand=True)
+        self.bind("<Button-1>", self._on_toggle)
+        self.bind("<Enter>", self._on_hover_enter)
+        self.bind("<Leave>", self._on_hover_leave)
+        self.bind("<Configure>", self._on_configure)
+        self.bind("<Destroy>", self._on_destroy)
+        self._redraw()
 
-        self._lbl = ctk.CTkLabel(
-            self._btn_frame,
-            text=self._current_value,
-            font=ctk.CTkFont(size=12),
-            text_color=txt_c,
-            anchor="w",
-            cursor="hand2"
-        )
-        self._lbl.pack(side="left", fill="x", expand=True, padx=(14, 6))
+    def _on_destroy(self, event=None):
+        self._unbind_events()
+        if self._popup and self._popup.winfo_exists():
+            try:
+                self._popup.destroy()
+            except Exception:
+                pass
+        self._popup = None
+        if ModernOptionMenu.active_menu == self:
+            ModernOptionMenu.active_menu = None
 
-        # Chevron pill on the right
-        self._pill = ctk.CTkFrame(
-            self._btn_frame,
-            width=30,
-            height=24,
-            corner_radius=6,
-            fg_color=button_color or ORANGE_PRIMARY,
-            cursor="hand2"
-        )
-        self._pill.pack(side="right", padx=(0, 6))
-        self._pill.pack_propagate(False)
-
-        self._chevron = ctk.CTkLabel(
-            self._pill,
-            text="▼",
-            font=ctk.CTkFont(size=12, weight="bold"),
-            text_color="#FFFFFF",
-            cursor="hand2"
-        )
-        self._chevron.place(relx=0.5, rely=0.5, anchor="center")
-
-        interactive = [self, self._btn_frame, self._lbl, self._pill, self._chevron]
-        for w in interactive:
-            w.bind("<Button-1>", self._on_toggle, add=True)
-            w.bind("<Enter>", self._on_hover_enter, add=True)
-            w.bind("<Leave>", self._on_hover_leave, add=True)
+    def _on_configure(self, event):
+        if not self.winfo_exists():
+            return
+        if event.width > 20 and event.width != self._current_w:
+            self._current_w = event.width
+            self._redraw()
 
     def _on_hover_enter(self, event=None):
-        if self._state == "disabled":
+        if not self.winfo_exists() or self._state == "disabled":
             return
-        self.configure(border_color=ORANGE_PRIMARY)
-        self._pill.configure(fg_color=ORANGE_HOVER)
+        self._hovered = True
+        self._redraw()
 
     def _on_hover_leave(self, event=None):
-        if not self._popup:
-            self.configure(border_color=BORDER_CARD)
-            self._pill.configure(fg_color=ORANGE_PRIMARY)
+        if not self.winfo_exists():
+            return
+        self._hovered = False
+        self._redraw()
 
     def _on_toggle(self, event=None):
-        if self._state == "disabled":
+        if not self.winfo_exists() or self._state == "disabled":
+            return
+        now = time.time()
+        if getattr(self, "_last_close_time", 0) and (now - self._last_close_time < 0.25):
             return
         if self._popup and self._popup.winfo_exists():
             self._close_popup()
         else:
             self._open_popup()
 
+    def _redraw(self):
+        if not self.winfo_exists():
+            return
+        w = max(50, self._current_w)
+        h = self._height
+        scale = 4
+        sw, sh = w * scale, h * scale
+        r = 8 * scale
+        bw = 1 * scale
+
+        is_open = bool(self._popup and self._popup.winfo_exists())
+        if is_open:
+            border = _color_to_rgba(ORANGE_PRIMARY, 255)
+            chevron_c = _color_to_rgba(ORANGE_PRIMARY, 255)
+        elif self._hovered:
+            border = _color_to_rgba(("#9CA3AF", "#4B5568"), 255)
+            chevron_c = _color_to_rgba(ORANGE_PRIMARY, 255)
+        else:
+            border = _color_to_rgba(BORDER_CARD, 255)
+            chevron_c = _color_to_rgba(("#64748B", "#818898"), 255)
+
+        bg = _color_to_rgba(self._fg_color, 255)
+        txt_c = _color_to_rgba(TEXT_MUTED if self._state == "disabled" else self._text_color, 255)
+
+        bg_rgb = _get_widget_bg_rgb(self)
+        img = Image.new("RGBA", (sw, sh), (*bg_rgb, 255))
+        d = ImageDraw.Draw(img)
+        d.rounded_rectangle([bw // 2, bw // 2, sw - 1 - bw // 2, sh - 1 - bw // 2], radius=r, fill=bg, outline=border, width=bw)
+
+        # Label text
+        font_path = Path(__file__).resolve().parent / "assets" / "fonts" / "Inter-Regular.ttf"
+        try:
+            font = ImageFont.truetype(str(font_path), int(12 * scale))
+        except Exception:
+            try:
+                font = ImageFont.truetype("arial.ttf", int(12 * scale))
+            except Exception:
+                font = ImageFont.load_default()
+
+        val_str = str(self._current_value) if self._current_value else ""
+        if val_str:
+            bbox = d.textbbox((0, 0), val_str, font=font)
+            th = bbox[3] - bbox[1]
+            tx = 16 * scale
+            ty = (sh - th) // 2 - bbox[1]
+            max_text_w = sw - (45 * scale)
+            if (bbox[2] - bbox[0]) > max_text_w:
+                while len(val_str) > 3 and (bbox[2] - bbox[0]) > max_text_w:
+                    val_str = val_str[:-4] + "..."
+                    bbox = d.textbbox((0, 0), val_str, font=font)
+            d.text((tx, ty), val_str, fill=txt_c, font=font)
+
+        # Crisp anti-aliased vector chevron (eliminates missing font glyph box on Windows)
+        chv_size = int(3.8 * scale)
+        chv_cx = sw - int(20 * scale)
+        chv_cy = sh // 2
+        chv_w = max(1, int(1.8 * scale))
+        if is_open:
+            p1 = (chv_cx - chv_size, chv_cy + int(1.8 * scale))
+            p2 = (chv_cx, chv_cy - int(1.8 * scale))
+            p3 = (chv_cx + chv_size, chv_cy + int(1.8 * scale))
+        else:
+            p1 = (chv_cx - chv_size, chv_cy - int(1.8 * scale))
+            p2 = (chv_cx, chv_cy + int(1.8 * scale))
+            p3 = (chv_cx + chv_size, chv_cy - int(1.8 * scale))
+        d.line([p1, p2, p3], fill=chevron_c, width=chv_w, joint="round")
+
+        res = img.resize((w, h), Image.Resampling.LANCZOS)
+        ci = ctk.CTkImage(light_image=res, dark_image=res, size=(w, h))
+        super().configure(image=ci)
+
+    def _set_appearance_mode(self, mode_string):
+        super()._set_appearance_mode(mode_string)
+        self._redraw()
+
     def _open_popup(self):
         if ModernOptionMenu.active_menu and ModernOptionMenu.active_menu != self:
             ModernOptionMenu.active_menu._close_popup()
         ModernOptionMenu.active_menu = self
 
-        self.update_idletasks()
-        self.configure(border_color=ORANGE_PRIMARY)
-        self._chevron.configure(text="▲")
-
         self._popup = tw = ctk.CTkToplevel(self)
-        tw.wm_overrideredirect(True)
+        self.update_idletasks()
+        if self.winfo_exists():
+            self._redraw()
+
+        root = self.winfo_toplevel()
+
         try:
-            tw.attributes("-topmost", True)
-            if sys.platform.startswith("win"):
-                tw.attributes("-transparentcolor", "#000001")
-                tw.configure(fg_color="#000001")
-            else:
-                tw.configure(fg_color="transparent")
+            tw.transient(root)
         except Exception:
             pass
+        tw.wm_overrideredirect(True)
+        tw.lift()
 
+        # Sleek modern card with refined subtle dark border
+        tw.configure(fg_color=("#FFFFFF", "#1E202B"))
         card = ctk.CTkFrame(
             tw,
-            corner_radius=12,
-            fg_color=BG_CARD,
+            corner_radius=10,
+            fg_color=("#FFFFFF", "#1E202B"),
             border_width=1,
-            border_color=ORANGE_PRIMARY
+            border_color=("#D1D5DB", "#373C4D")
         )
-        card.pack(fill="both", expand=True, padx=2, pady=2)
+        card.pack(fill="both", expand=True)
 
         use_scroll = len(self.values) > 6
         if use_scroll:
@@ -1143,50 +1458,154 @@ class ModernOptionMenu(ctk.CTkFrame):
 
         for val in self.values:
             is_sel = (val == self._current_value)
-            t_disp = f"{'✓  ' if is_sel else '    '}{val}"
-            item_row = ctk.CTkButton(
+            bg_norm = "transparent"
+            bg_hover = ("#F1F5F9", "#282B37")
+            fg_norm = ORANGE_PRIMARY if is_sel else TEXT_TITLE
+            fg_hover = ORANGE_PRIMARY if is_sel else ("#0F172A", "#FFFFFF")
+
+            row = ctk.CTkFrame(
                 container,
-                text=t_disp,
-                anchor="w",
-                height=34,
-                corner_radius=8,
-                fg_color=("#FFF7ED", "#26170E") if is_sel else "transparent",
-                text_color=ORANGE_PRIMARY if is_sel else TEXT_TITLE,
-                hover_color=("#F3F4F6", "#252834"),
-                font=ctk.CTkFont(size=12, weight="bold" if is_sel else "normal"),
-                command=lambda v=val: self._on_user_select(v)
+                height=38,
+                corner_radius=6,
+                fg_color=bg_norm,
+                cursor="hand2"
             )
-            item_row.pack(fill="x", padx=2, pady=2)
+            row.pack(fill="x", padx=2, pady=2)
+            row.pack_propagate(False)
+
+            lbl = ctk.CTkLabel(
+                row,
+                text=val,
+                anchor="w",
+                font=ctk.CTkFont(family=APP_FONT_FAMILY, size=12, weight="bold" if is_sel else "normal"),
+                text_color=fg_norm,
+                cursor="hand2"
+            )
+            lbl.pack(side="left", fill="both", expand=True, padx=(12, 6))
+
+            chk = None
+            if is_sel:
+                chk = ctk.CTkLabel(
+                    row,
+                    text="✓",
+                    font=ctk.CTkFont(family=APP_FONT_FAMILY, size=13, weight="bold"),
+                    text_color=ORANGE_PRIMARY,
+                    cursor="hand2"
+                )
+                chk.pack(side="right", padx=(0, 12))
+
+            items_to_bind = [row, lbl]
+            if chk:
+                items_to_bind.append(chk)
+
+            def make_hover_handlers(r=row, l=lbl, bn=bg_norm, bh=bg_hover, fn=fg_norm, fh=fg_hover):
+                def _enter(e=None):
+                    if r.winfo_exists():
+                        r.configure(fg_color=bh)
+                    if l.winfo_exists():
+                        l.configure(text_color=fh)
+                def _leave(e=None):
+                    if not r.winfo_exists():
+                        return
+                    if e is not None:
+                        try:
+                            rx = r.winfo_rootx()
+                            ry = r.winfo_rooty()
+                            rw = r.winfo_width()
+                            rh = r.winfo_height()
+                            if rx <= e.x_root < rx + rw and ry <= e.y_root < ry + rh:
+                                return
+                        except Exception:
+                            pass
+                    r.configure(fg_color=bn)
+                    if l.winfo_exists():
+                        l.configure(text_color=fn)
+                return _enter, _leave
+
+            _ent, _lev = make_hover_handlers()
+            for w in items_to_bind:
+                w.bind("<Enter>", _ent)
+                w.bind("<Leave>", _lev)
+                w.bind("<Button-1>", lambda _, v=val: self._on_user_select(v))
 
         btn_w = self.winfo_width()
         btn_h = self.winfo_height()
         rx = self.winfo_rootx()
         ry = self.winfo_rooty()
 
-        calc_h = min(len(self.values) * 38 + 16, 260 if use_scroll else 400)
-        pop_w = max(btn_w, 320)
+        calc_h = min(len(self.values) * 42 + 12, 260 if use_scroll else 400)
+        pop_w = max(btn_w, 200)
 
         screen_h = self.winfo_screenheight()
-        target_y = ry + btn_h + 4
+        target_y = ry + btn_h + 3
         if target_y + calc_h > screen_h - 20:
-            target_y = max(8, ry - calc_h - 4)
+            target_y = max(8, ry - calc_h - 3)
 
         tw.geometry(f"{pop_w}x{calc_h}+{rx}+{target_y}")
 
-        root = self.winfo_toplevel()
-        def on_outside_click(event):
-            if self._popup and self._popup.winfo_exists():
-                try:
-                    px = self._popup.winfo_rootx()
-                    py = self._popup.winfo_rooty()
-                    pw = self._popup.winfo_width()
-                    ph = self._popup.winfo_height()
-                    if not (px <= event.x_root <= px + pw and py <= event.y_root <= py + ph):
-                        self._close_popup()
-                except Exception:
+        # Cleanup existing bindings
+        self._unbind_events()
+
+        def on_global_click(event):
+            if not self._popup or not self._popup.winfo_exists():
+                return
+            try:
+                px = self._popup.winfo_rootx()
+                py = self._popup.winfo_rooty()
+                pw = self._popup.winfo_width()
+                ph = self._popup.winfo_height()
+                if px <= event.x_root <= px + pw and py <= event.y_root <= py + ph:
+                    return
+
+                bx = self.winfo_rootx()
+                by = self.winfo_rooty()
+                bw = self.winfo_width()
+                bh = self.winfo_height()
+                if bx <= event.x_root <= bx + bw and by <= event.y_root <= by + bh:
                     self._close_popup()
-        root.bind("<Button-1>", on_outside_click, add=True)
-        tw.bind("<Escape>", lambda _: self._close_popup())
+                    return
+
+                self._close_popup()
+            except Exception:
+                self._close_popup()
+
+        def on_root_unmap(e):
+            if e.widget == root and root.state() == "iconic":
+                self._close_popup()
+
+        def add_b(target, seq, func):
+            try:
+                bid = target.bind(seq, func, add="+")
+                self._bound_handlers.append((target, seq, bid))
+            except Exception:
+                pass
+
+        # Global event listeners across root
+        add_b(root, "<Button-1>", on_global_click)
+        add_b(root, "<Button-2>", on_global_click)
+        add_b(root, "<Button-3>", on_global_click)
+        add_b(root, "<MouseWheel>", lambda _: self._close_popup())
+        add_b(root, "<Escape>", lambda _: self._close_popup())
+        add_b(root, "<Unmap>", on_root_unmap)
+        add_b(root, "<Deactivate>", lambda _: self._close_popup())
+
+        add_b(tw, "<Escape>", lambda _: self._close_popup())
+
+    def _unbind_events(self):
+        if hasattr(self, "_heartbeat_id") and self._heartbeat_id:
+            try:
+                self.after_cancel(self._heartbeat_id)
+            except Exception:
+                pass
+            self._heartbeat_id = None
+
+        if hasattr(self, "_bound_handlers"):
+            for target, seq, bid in self._bound_handlers:
+                try:
+                    target.unbind(seq, bid)
+                except Exception:
+                    pass
+            self._bound_handlers.clear()
 
     def _on_user_select(self, value: str):
         self.set(value)
@@ -1198,11 +1617,11 @@ class ModernOptionMenu(ctk.CTkFrame):
 
     def set(self, value: str):
         self._current_value = value
-        if hasattr(self, "_lbl") and self._lbl.winfo_exists():
-            self._lbl.configure(text=value)
         if self.variable and self.variable.get() != value:
             self.variable.set(value)
         self._close_popup()
+        if self.winfo_exists():
+            self._redraw()
 
     def get(self) -> str:
         return self._current_value
@@ -1217,11 +1636,15 @@ class ModernOptionMenu(ctk.CTkFrame):
         if "state" in kwargs:
             self._state = kwargs.pop("state")
             cursor = "arrow" if self._state == "disabled" else "hand2"
-            color = TEXT_MUTED if self._state == "disabled" else TEXT_TITLE
-            self._lbl.configure(text_color=color, cursor=cursor)
-            self._btn_frame.configure(cursor=cursor)
-            super().configure(require_redraw=require_redraw, cursor=cursor)
-        super().configure(require_redraw=require_redraw, **kwargs)
+            super().configure(cursor=cursor)
+        if "command" in kwargs:
+            self.command = kwargs.pop("command")
+        if "variable" in kwargs:
+            self.variable = kwargs.pop("variable")
+        if kwargs:
+            super().configure(**kwargs)
+        if self.winfo_exists():
+            self._redraw()
 
     def cget(self, attribute_name: str):
         if attribute_name == "values":
@@ -1231,7 +1654,14 @@ class ModernOptionMenu(ctk.CTkFrame):
         return super().cget(attribute_name)
 
     def _close_popup(self):
+        self._last_close_time = time.time()
+        self._unbind_events()
+
         if self._popup and self._popup.winfo_exists():
+            try:
+                self._popup.grab_release()
+            except Exception:
+                pass
             try:
                 self._popup.destroy()
             except Exception:
@@ -1239,10 +1669,684 @@ class ModernOptionMenu(ctk.CTkFrame):
         self._popup = None
         if ModernOptionMenu.active_menu == self:
             ModernOptionMenu.active_menu = None
-        self.configure(border_color=BORDER_CARD)
-        self._pill.configure(fg_color=ORANGE_PRIMARY)
-        if hasattr(self, "_chevron") and self._chevron.winfo_exists():
-            self._chevron.configure(text="▼")
+        try:
+            if self.winfo_exists():
+                self._redraw()
+        except Exception:
+            pass
+
+
+# -----------------------------------------------------------------------------
+# Modern Rounded Anti-Aliased CheckBox (Replaces distorted CTkCheckBox)
+# -----------------------------------------------------------------------------
+
+class ModernCheckBox(ctk.CTkFrame):
+    """
+    Pixel-perfect, anti-aliased modern rounded checkbox.
+    Replaces CustomTkinter's font-shapes CTkCheckBox which produces jagged,
+    distorted corners and bulging curves on Windows.
+    Provides mathematically smooth rounded corners (4x supersampling with Lanczos),
+    crisp checkmark geometry, full-row clickability, and hover feedback.
+    """
+    _icon_cache: Dict[int, Dict[str, ctk.CTkImage]] = {}
+
+    @classmethod
+    def _get_icons(cls, size: int = 22) -> Dict[str, ctk.CTkImage]:
+        if size in cls._icon_cache:
+            return cls._icon_cache[size]
+
+        scale = 4
+        s = size * scale
+        r = int(5.5 * scale)
+        bw = int(1.8 * scale)
+
+        def make_box(fill, outline, is_checked=False, bg=(23, 24, 33)):
+            img = Image.new("RGBA", (s, s), (*bg, 255))
+            d = ImageDraw.Draw(img)
+            if outline:
+                d.rounded_rectangle([bw // 2, bw // 2, s - 1 - bw // 2, s - 1 - bw // 2], radius=r, fill=fill, outline=outline, width=bw)
+            else:
+                d.rounded_rectangle([0, 0, s - 1, s - 1], radius=r, fill=fill)
+            if is_checked:
+                cw = int(2.4 * scale)
+                p1 = (s * 0.27, s * 0.50)
+                p2 = (s * 0.44, s * 0.69)
+                p3 = (s * 0.74, s * 0.31)
+                d.line([p1, p2, p3], fill=(255, 255, 255, 255), width=cw, joint="curve")
+            return img.resize((size, size), Image.Resampling.LANCZOS)
+
+        bg_d = (23, 24, 33)
+        bg_l = (241, 243, 247)
+
+        u_dark = make_box((28, 30, 39, 255), (66, 72, 92, 255), bg=bg_d)
+        u_dark_h = make_box((35, 38, 50, 255), (255, 87, 34, 255), bg=bg_d)
+        u_light = make_box((255, 255, 255, 255), (203, 213, 225, 255), bg=bg_l)
+        u_light_h = make_box((248, 250, 252, 255), (255, 87, 34, 255), bg=bg_l)
+
+        c_dark = make_box((255, 87, 34, 255), None, is_checked=True, bg=bg_d)
+        c_dark_h = make_box((255, 110, 64, 255), None, is_checked=True, bg=bg_d)
+        c_light = make_box((255, 87, 34, 255), None, is_checked=True, bg=bg_l)
+        c_light_h = make_box((255, 110, 64, 255), None, is_checked=True, bg=bg_l)
+
+        icons = {
+            "unchecked": ctk.CTkImage(light_image=u_light, dark_image=u_dark, size=(size, size)),
+            "unchecked_hover": ctk.CTkImage(light_image=u_light_h, dark_image=u_dark_h, size=(size, size)),
+            "checked": ctk.CTkImage(light_image=c_light, dark_image=c_dark, size=(size, size)),
+            "checked_hover": ctk.CTkImage(light_image=c_light_h, dark_image=c_dark_h, size=(size, size))
+        }
+        cls._icon_cache[size] = icons
+        return icons
+
+    def __init__(
+        self,
+        parent,
+        text: str = "",
+        variable: Optional[Any] = None,
+        command: Optional[Callable] = None,
+        font: Optional[ctk.CTkFont] = None,
+        text_color: Optional[Any] = None,
+        size: int = 22,
+        **kwargs
+    ):
+        super().__init__(parent, fg_color="transparent", cursor="hand2")
+        self.variable = variable if variable is not None else ctk.BooleanVar(value=False)
+        self.command = command
+        self._size = size
+        self._icons = self._get_icons(size)
+        self._hovered = False
+        self._state = kwargs.get("state", "normal")
+
+        # Checkbox square icon
+        self._box_lbl = ctk.CTkLabel(
+            self,
+            text="",
+            image=self._get_current_image(),
+            width=size,
+            height=size,
+            cursor="hand2"
+        )
+        self._box_lbl.pack(side="left", padx=(0, 10))
+
+        # Checkbox label text
+        self._text_lbl = ctk.CTkLabel(
+            self,
+            text=text,
+            font=font or ctk.CTkFont(family=APP_FONT_FAMILY, size=13, weight="bold"),
+            text_color=text_color or TEXT_TITLE,
+            anchor="w",
+            cursor="hand2"
+        )
+        self._text_lbl.pack(side="left")
+
+        for w in (self, self._box_lbl, self._text_lbl):
+            w.bind("<Button-1>", self._on_click)
+            w.bind("<Enter>", self._on_enter)
+            w.bind("<Leave>", self._on_leave)
+
+        if hasattr(self.variable, "trace_add"):
+            self._trace_id = self.variable.trace_add("write", lambda *_: self._update_image())
+        elif hasattr(self.variable, "trace"):
+            self._trace_id = self.variable.trace("w", lambda *_: self._update_image())
+
+    def _get_current_image(self) -> ctk.CTkImage:
+        val = bool(self.variable.get()) if self.variable else False
+        if val:
+            return self._icons["checked_hover"] if self._hovered else self._icons["checked"]
+        else:
+            return self._icons["unchecked_hover"] if self._hovered else self._icons["unchecked"]
+
+    def _update_image(self):
+        if hasattr(self, "_box_lbl") and self._box_lbl.winfo_exists():
+            self._box_lbl.configure(image=self._get_current_image())
+
+    def _on_enter(self, event=None):
+        if self._state == "disabled":
+            return
+        self._hovered = True
+        self._update_image()
+
+    def _on_leave(self, event=None):
+        self._hovered = False
+        self._update_image()
+
+    def _on_click(self, event=None):
+        if self._state == "disabled":
+            return
+        new_val = not bool(self.variable.get())
+        self.variable.set(new_val)
+        self._update_image()
+        if callable(self.command):
+            try:
+                self.command()
+            except Exception as e:
+                print(f"[ModernCheckBox] Error in callback: {e}")
+
+    def get(self) -> bool:
+        return bool(self.variable.get())
+
+    def set(self, value: bool):
+        self.variable.set(bool(value))
+        self._update_image()
+
+    def select(self):
+        self.set(True)
+
+    def deselect(self):
+        self.set(False)
+
+    def toggle(self):
+        self._on_click()
+
+    def configure(self, require_redraw=False, **kwargs):
+        if "text" in kwargs:
+            self._text_lbl.configure(text=kwargs.pop("text"))
+        if "font" in kwargs:
+            self._text_lbl.configure(font=kwargs.pop("font"))
+        if "text_color" in kwargs:
+            self._text_lbl.configure(text_color=kwargs.pop("text_color"))
+        if "command" in kwargs:
+            self.command = kwargs.pop("command")
+        if "state" in kwargs:
+            self._state = kwargs.pop("state")
+            cursor = "arrow" if self._state == "disabled" else "hand2"
+            self._box_lbl.configure(cursor=cursor)
+            self._text_lbl.configure(cursor=cursor)
+            super().configure(require_redraw=require_redraw, cursor=cursor)
+        if "variable" in kwargs:
+            self.variable = kwargs.pop("variable")
+            self._update_image()
+        kwargs.pop("fg_color", None)
+        kwargs.pop("hover_color", None)
+        kwargs.pop("border_color", None)
+        if kwargs:
+            super().configure(require_redraw=require_redraw, **kwargs)
+
+    def cget(self, attribute_name: str):
+        if attribute_name == "text":
+            return self._text_lbl.cget("text")
+        if attribute_name == "state":
+            return self._state
+        return super().cget(attribute_name)
+
+
+# -----------------------------------------------------------------------------
+# Modern Rounded Anti-Aliased Button (Replaces pixelated CTkButton)
+# -----------------------------------------------------------------------------
+
+class ModernButton(ctk.CTkLabel):
+    """
+    Ultra-smooth, anti-aliased modern rounded button.
+    Replaces CustomTkinter's CTkButton which suffers from pixelated GDI font-shapes staircase artifacts on Windows.
+    Provides true 4x Lanczos anti-aliased rounded corners, crisp vector outlines,
+    proper optical icon+text layout, smooth hover states, and dynamic width expansion.
+    """
+    def __init__(
+        self,
+        parent,
+        text: str = "",
+        command: Optional[Callable] = None,
+        image: Optional[ctk.CTkImage] = None,
+        compound: str = "left",
+        width: int = 140,
+        height: int = 38,
+        corner_radius: int = 8,
+        fg_color: Any = ORANGE_PRIMARY,
+        hover_color: Any = ORANGE_HOVER,
+        border_color: Any = None,
+        border_width: int = 0,
+        text_color: Any = "#FFFFFF",
+        hover_text_color: Optional[Any] = None,
+        font: Any = None,
+        state: str = "normal",
+        circle_mode: bool = False,
+        **kwargs
+    ):
+        cursor = "arrow" if state == "disabled" else "hand2"
+        super().__init__(
+            parent,
+            text="",
+            width=width,
+            height=height,
+            fg_color="transparent",
+            corner_radius=0,
+            cursor=cursor,
+            **kwargs
+        )
+        self._text = text
+        self.command = command
+        self._image_prop = image
+        self._compound = compound
+        self._target_w = width
+        self._height = height
+        self._current_w = width
+        self._corner_radius = corner_radius
+        self._fg_color = fg_color
+        self._hover_color = hover_color
+        self._border_color = border_color
+        self._border_width = border_width
+        self._text_color = text_color
+        self._hover_text_color = hover_text_color
+        self._font_prop = font
+        self._state = state
+        self._hovered = False
+        self._circle_mode = circle_mode
+
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        self.bind("<Button-1>", self._on_click)
+        self.bind("<Configure>", self._on_configure)
+        self._redraw()
+
+    def _create_grid(self):
+        self._label.grid(row=0, column=0, sticky="", padx=0, pady=0)
+
+    def _on_enter(self, event=None):
+        if not self.winfo_exists() or self._state == "disabled":
+            return
+        self._hovered = True
+        self._redraw()
+
+    def _on_leave(self, event=None):
+        if not self.winfo_exists():
+            return
+        self._hovered = False
+        self._redraw()
+
+    def _on_click(self, event=None):
+        if not self.winfo_exists() or self._state == "disabled":
+            return
+        if callable(self.command):
+            try:
+                self.command()
+            except Exception as err:
+                print(f"[ModernButton] Error in callback: {err}")
+
+    def _on_configure(self, event):
+        if not self.winfo_exists():
+            return
+        if getattr(self, "_circle_mode", False):
+            return
+        if event.width > 20 and event.width != self._current_w:
+            self._current_w = event.width
+            self._redraw()
+
+    def _set_appearance_mode(self, mode_string):
+        super()._set_appearance_mode(mode_string)
+        self._redraw()
+
+    def configure(self, require_redraw=False, **kwargs):
+        if "text" in kwargs:
+            self._text = kwargs.pop("text")
+        if "image" in kwargs:
+            self._image_prop = kwargs.pop("image")
+        if "command" in kwargs:
+            self.command = kwargs.pop("command")
+        if "fg_color" in kwargs:
+            self._fg_color = kwargs.pop("fg_color")
+        if "hover_color" in kwargs:
+            self._hover_color = kwargs.pop("hover_color")
+        if "border_color" in kwargs:
+            self._border_color = kwargs.pop("border_color")
+        if "border_width" in kwargs:
+            self._border_width = kwargs.pop("border_width")
+        if "text_color" in kwargs:
+            self._text_color = kwargs.pop("text_color")
+        if "corner_radius" in kwargs:
+            self._corner_radius = kwargs.pop("corner_radius")
+        if "state" in kwargs:
+            self._state = kwargs.pop("state")
+            cursor = "arrow" if self._state == "disabled" else "hand2"
+            super().configure(cursor=cursor)
+        if kwargs:
+            super().configure(**kwargs)
+        if self.winfo_exists():
+            self._redraw()
+
+    def cget(self, attribute_name: str):
+        if attribute_name == "text":
+            return self._text
+        if attribute_name == "state":
+            return self._state
+        if attribute_name == "fg_color":
+            return self._fg_color
+        return super().cget(attribute_name)
+
+    def _redraw(self):
+        if not self.winfo_exists():
+            return
+        if getattr(self, "_circle_mode", False):
+            w = self._height
+            h = self._height
+        else:
+            w = max(30, self._current_w)
+            h = self._height
+        scale = 4
+        sw, sh = w * scale, h * scale
+        r = self._corner_radius * scale
+        bw = self._border_width * scale
+
+        is_disabled = (self._state == "disabled")
+        if is_disabled:
+            fill_c = _color_to_rgba(self._fg_color, 110)
+            border_c = _color_to_rgba(self._border_color, 90) if self._border_width > 0 else None
+            txt_c = _color_to_rgba(self._text_color, 110)
+        elif self._hovered and self._hover_color:
+            fill_c = _color_to_rgba(self._hover_color, 255)
+            border_c = _color_to_rgba(self._border_color, 255) if self._border_width > 0 else None
+            txt_c = _color_to_rgba(self._hover_text_color if self._hover_text_color else self._text_color, 255)
+        else:
+            fill_c = _color_to_rgba(self._fg_color, 255)
+            border_c = _color_to_rgba(self._border_color, 255) if self._border_width > 0 else None
+            txt_c = _color_to_rgba(self._text_color, 255)
+
+
+        bg_rgb = _get_widget_bg_rgb(self)
+        img = Image.new("RGBA", (sw, sh), (*bg_rgb, 255))
+        d = ImageDraw.Draw(img)
+        if getattr(self, "_circle_mode", False):
+            if border_c and bw > 0:
+                d.ellipse([bw // 2, bw // 2, sw - 1 - bw // 2, sh - 1 - bw // 2], fill=fill_c, outline=border_c, width=bw)
+            else:
+                d.ellipse([0, 0, sw - 1, sh - 1], fill=fill_c)
+        else:
+            if border_c and bw > 0:
+                d.rounded_rectangle([bw // 2, bw // 2, sw - 1 - bw // 2, sh - 1 - bw // 2], radius=r, fill=fill_c, outline=border_c, width=bw)
+            else:
+                d.rounded_rectangle([0, 0, sw - 1, sh - 1], radius=r, fill=fill_c)
+
+
+        # Font
+        f_size = 13
+        f_weight = "normal"
+        if self._font_prop:
+            try:
+                if hasattr(self._font_prop, "cget"):
+                    f_size = self._font_prop.cget("size")
+                    f_weight = self._font_prop.cget("weight")
+                elif isinstance(self._font_prop, tuple):
+                    if len(self._font_prop) > 1:
+                        f_size = self._font_prop[1]
+                    if len(self._font_prop) > 2:
+                        f_weight = self._font_prop[2]
+            except Exception:
+                pass
+        f_file = "Inter-Bold.ttf" if str(f_weight).lower() in ("bold", "700") else "Inter-Regular.ttf"
+        font_path = Path(__file__).resolve().parent / "assets" / "fonts" / f_file
+        try:
+            font = ImageFont.truetype(str(font_path), int(f_size * scale))
+        except Exception:
+            try:
+                fb = "arialbd.ttf" if "bold" in str(f_weight).lower() else "arial.ttf"
+                font = ImageFont.truetype(fb, int(f_size * scale))
+            except Exception:
+                font = ImageFont.load_default()
+
+        # Icon extraction
+        icon_img = None
+        icon_w, icon_h = 0, 0
+        if self._image_prop and isinstance(self._image_prop, ctk.CTkImage):
+            mode = ctk.get_appearance_mode()
+            raw_im = self._image_prop._dark_image if (mode == "Dark" and self._image_prop._dark_image) else self._image_prop._light_image
+            if raw_im:
+                isize = getattr(self._image_prop, "_size", (20, 20))
+                icon_w, icon_h = int(isize[0] * scale), int(isize[1] * scale)
+                icon_img = raw_im.resize((icon_w, icon_h), Image.Resampling.LANCZOS)
+                if is_disabled:
+                    r_ch, g_ch, b_ch, a_ch = icon_img.split()
+                    a_dim = a_ch.point(lambda p: int(p * 0.45))
+                    icon_img = Image.merge("RGBA", (r_ch, g_ch, b_ch, a_dim))
+
+        # Text measurement
+        tw, th, tx_off, ty_off = 0, 0, 0, 0
+        if self._text:
+            bbox = d.textbbox((0, 0), self._text, font=font)
+            tw = int(bbox[2] - bbox[0])
+            th = int(bbox[3] - bbox[1])
+            tx_off, ty_off = int(bbox[0]), int(bbox[1])
+
+        spacing = int(8 * scale) if (icon_img and self._text) else 0
+        total_content_w = icon_w + spacing + tw
+        start_x = int((sw - total_content_w) // 2)
+
+        if icon_img:
+            img.paste(icon_img, (int(start_x), int((sh - icon_h) // 2)), icon_img)
+            start_x = int(start_x + icon_w + spacing)
+
+        if self._text:
+            text_y = int((sh - th) // 2 - ty_off)
+            d.text((int(start_x - tx_off), text_y), self._text, fill=txt_c, font=font)
+
+        res = img.resize((w, h), Image.Resampling.LANCZOS)
+        ci = ctk.CTkImage(light_image=res, dark_image=res, size=(w, h))
+        super().configure(width=w, height=h, image=ci)
+
+
+# -----------------------------------------------------------------------------
+# Modern Smooth Anti-Aliased Progress Bar (Replaces glitchy CTkProgressBar)
+# -----------------------------------------------------------------------------
+
+class ModernProgressBar(ctk.CTkLabel):
+    """
+    Silky-smooth, anti-aliased modern progress bar.
+    Replaces CTkProgressBar which suffers from a flat, cut-off chunk on low values
+    and pixelated edges on Windows.
+    At 0% (val <= 0.001), only the clean dark rounded track is drawn.
+    When progress starts (> 0.001), it starts as a perfect circle and smoothly expands into a rounded capsule.
+    """
+    def __init__(
+        self,
+        parent,
+        height: int = 14,
+        fg_color: Any = None,
+        progress_color: Any = None,
+        **kwargs
+    ):
+        super().__init__(
+            parent,
+            text="",
+            height=height,
+            fg_color="transparent",
+            **kwargs
+        )
+        self._height = height
+        self._val = 0.0
+        self._width = 200
+        self._fg_color = fg_color or TRACK_COLOR
+        self._progress_color = progress_color or ORANGE_PRIMARY
+        self.bind("<Configure>", self._on_configure)
+        self._redraw()
+
+    def _on_configure(self, event):
+        if not self.winfo_exists():
+            return
+        if event.width > 20 and event.width != self._width:
+            self._width = event.width
+            self._redraw()
+
+    def set(self, val: float):
+        self._val = max(0.0, min(1.0, float(val)))
+        if self.winfo_exists():
+            self._redraw()
+
+    def get(self) -> float:
+        return self._val
+
+    def configure(self, require_redraw=False, **kwargs):
+        if "fg_color" in kwargs:
+            self._fg_color = kwargs.pop("fg_color")
+        if "progress_color" in kwargs:
+            self._progress_color = kwargs.pop("progress_color")
+        if "height" in kwargs:
+            self._height = kwargs.pop("height")
+        if kwargs:
+            super().configure(**kwargs)
+        if self.winfo_exists():
+            self._redraw()
+
+    def cget(self, attribute_name: str):
+        if attribute_name == "fg_color":
+            return self._fg_color
+        if attribute_name == "progress_color":
+            return self._progress_color
+        return super().cget(attribute_name)
+
+    def _redraw(self):
+        if not self.winfo_exists():
+            return
+        w = max(20, self._width)
+        h = self._height
+        scale = 4
+        sw, sh = w * scale, h * scale
+        r = sh // 2
+
+        track_c = _color_to_rgba(self._fg_color, 255)
+        prog_c = _color_to_rgba(self._progress_color, 255)
+
+        bg_rgb = _get_widget_bg_rgb(self)
+        img = Image.new("RGBA", (sw, sh), (*bg_rgb, 255))
+        d = ImageDraw.Draw(img)
+        # Smooth anti-aliased track
+        d.rounded_rectangle([0, 0, sw - 1, sh - 1], radius=r, fill=track_c)
+
+        # Smooth anti-aliased progress fill
+        # At 0%, no orange fill is drawn at all (clean track).
+        # At > 0%, starts as a clean circle (diameter = height) and smoothly expands.
+        if self._val > 0.001:
+            fw = max(sh, int(sw * self._val))
+            fw = min(fw, sw)
+            d.rounded_rectangle([0, 0, fw - 1, sh - 1], radius=r, fill=prog_c)
+
+        res = img.resize((w, h), Image.Resampling.LANCZOS)
+        ci = ctk.CTkImage(light_image=res, dark_image=res, size=(w, h))
+        super().configure(image=ci)
+
+    def _set_appearance_mode(self, mode_string):
+        super()._set_appearance_mode(mode_string)
+        self._redraw()
+
+
+# -----------------------------------------------------------------------------
+# Modern Smooth Anti-Aliased Slider (Replaces pixelated CTkSlider knob)
+# -----------------------------------------------------------------------------
+
+class ModernSlider(ctk.CTkSlider):
+    """
+    Silky-smooth modern slider with a 4x supersampled anti-aliased circular knob.
+    Completely eliminates CustomTkinter's pixelated / octagonal knob rendering.
+    """
+    def __init__(self, *args, **kwargs):
+        self._knob_normal_img: Optional[ImageTk.PhotoImage] = None
+        self._knob_hover_img: Optional[ImageTk.PhotoImage] = None
+        self._knob_rendered_size: int = 0
+        self._knob_canvas_img_id: Optional[int] = None
+        self._is_dragging: bool = False
+        super().__init__(*args, **kwargs)
+        self._ensure_knob_images()
+        self._canvas.bind("<Button-1>", self._on_drag_start, add="+")
+        self._canvas.bind("<ButtonRelease-1>", self._on_drag_end, add="+")
+
+    def _set_appearance_mode(self, mode_string):
+        super()._set_appearance_mode(mode_string)
+        if hasattr(self, "_canvas"):
+            self._canvas.delete("modern_knob")
+        self._knob_canvas_img_id = None
+        self._knob_normal_img = None
+        self._knob_hover_img = None
+        self._knob_rendered_size = 0
+        self._ensure_knob_images()
+        self._draw()
+
+    def _on_enter(self, event=0):
+        super()._on_enter(event)
+        if hasattr(self, "_canvas"):
+            self._canvas.itemconfig("slider_parts", state="hidden")
+
+    def _on_leave(self, event=0):
+        super()._on_leave(event)
+        if hasattr(self, "_canvas"):
+            self._canvas.itemconfig("slider_parts", state="hidden")
+
+    def _on_drag_start(self, event=None):
+        self._is_dragging = True
+        self._draw()
+
+    def _on_drag_end(self, event=None):
+        self._is_dragging = False
+        self._draw()
+
+    def _ensure_knob_images(self):
+        if not hasattr(self, '_knob_rendered_size'):
+            self._knob_rendered_size = 0
+            self._knob_normal_img = None
+            self._knob_hover_img = None
+            self._knob_canvas_img_id = None
+            self._is_dragging = False
+
+        base_size = int(self._apply_widget_scaling(18))
+        if base_size < 12:
+            base_size = 18
+        if base_size == self._knob_rendered_size and self._knob_normal_img is not None:
+            return
+
+        scale = 4
+        s = base_size * scale
+        pad = int(2.0 * scale)
+
+        # Normal knob: crisp clean circular orange button with NO glow
+        img_n = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+        d_n = ImageDraw.Draw(img_n)
+        d_n.ellipse([pad, pad, s - 1 - pad, s - 1 - pad], fill=(255, 87, 34, 255), outline=(255, 125, 80, 255), width=int(1.2 * scale))
+        knob_n = img_n.resize((base_size, base_size), Image.Resampling.LANCZOS)
+        self._knob_normal_img = ImageTk.PhotoImage(knob_n)
+
+        # Active dragging knob: beautiful warm glowing aura ring
+        img_h = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+        d_h = ImageDraw.Draw(img_h)
+        d_h.ellipse([0, 0, s - 1, s - 1], fill=(255, 112, 67, 85))
+        d_h.ellipse([pad // 2, pad // 2, s - 1 - pad // 2, s - 1 - pad // 2], fill=(255, 112, 67, 140))
+        d_h.ellipse([pad, pad, s - 1 - pad, s - 1 - pad], fill=(255, 100, 50, 255), outline=(255, 150, 110, 255), width=int(1.5 * scale))
+        knob_h = img_h.resize((base_size, base_size), Image.Resampling.LANCZOS)
+        self._knob_hover_img = ImageTk.PhotoImage(knob_h)
+
+        self._knob_rendered_size = base_size
+
+    def _draw(self, no_color_updates: bool = False):
+        super()._draw(no_color_updates=no_color_updates)
+        self._canvas.itemconfig("slider_parts", state="hidden")
+        self._ensure_knob_images()
+        is_active = getattr(self, "_is_dragging", False)
+        knob_img = self._knob_hover_img if (is_active and self._knob_hover_img) else self._knob_normal_img
+        if knob_img is None:
+            return
+
+        w_scaled = self._apply_widget_scaling(self._current_width)
+        h_scaled = self._apply_widget_scaling(self._current_height)
+        cr = min(w_scaled / 2.0, h_scaled / 2.0)
+
+        val = float(self._value) if hasattr(self, "_value") else 0.5
+        val = max(0.0, min(1.0, val))
+
+        if self._orientation.lower() == "horizontal":
+            cx = cr + (w_scaled - 2.0 * cr) * val
+            cy = h_scaled / 2.0
+        else:
+            cx = w_scaled / 2.0
+            cy = cr + (h_scaled - 2.0 * cr) * (1.0 - val)
+
+        knob_items = self._canvas.find_withtag("modern_knob")
+        if not knob_items:
+            self._knob_canvas_img_id = self._canvas.create_image(
+                cx, cy, image=knob_img, anchor="center", tags="modern_knob"
+            )
+        else:
+            for extra in knob_items[1:]:
+                self._canvas.delete(extra)
+            self._knob_canvas_img_id = knob_items[0]
+            self._canvas.coords(self._knob_canvas_img_id, cx, cy)
+            self._canvas.itemconfig(self._knob_canvas_img_id, image=knob_img, state="normal")
+            self._canvas.tag_raise(self._knob_canvas_img_id)
+
+
 
 # -----------------------------------------------------------------------------
 # Settings Dialog Compatibility Stub (Now integrated natively into Pecislav Studio)
@@ -1359,9 +2463,19 @@ class ProjectHistoryDialog(ctk.CTkToplevel):
         self.update_idletasks()
         try:
             w, h = 920, 620
+            sw = self.winfo_screenwidth()
+            sh = self.winfo_screenheight()
             px, py = self.parent_app.winfo_x(), self.parent_app.winfo_y()
             pw, ph = self.parent_app.winfo_width(), self.parent_app.winfo_height()
-            self.geometry(f"{w}x{h}+{px + max(0, (pw - w) // 2)}+{py + max(0, (ph - h) // 2)}")
+            if pw > 100 and ph > 100:
+                cx = px + pw // 2
+                cy = py + ph // 2
+                x = max(10, min(sw - w - 10, cx - w // 2))
+                y = max(10, min(sh - h - 10, cy - h // 2))
+            else:
+                x = max(10, (sw - w) // 2)
+                y = max(10, (sh - h) // 2)
+            self.geometry(f"{w}x{h}+{x}+{y}")
         except Exception:
             pass
 
@@ -1414,13 +2528,13 @@ class ProjectHistoryDialog(ctk.CTkToplevel):
         lbl_s = ctk.CTkLabel(hdr, text=t_sub, font=ctk.CTkFont(size=12), text_color=TEXT_MUTED)
         lbl_s.pack(anchor="w", pady=(3, 0))
 
-        # Scrollable container for history items
+        # Scrollable container for history items (recessed background)
         self.scroll_list = ctk.CTkScrollableFrame(
             self,
-            fg_color=BG_CARD,
+            fg_color=("#E5E7EB", "#111217"),
             corner_radius=12,
             border_width=1,
-            border_color=BORDER_CARD
+            border_color=("#CBD5E1", "#22242D")
         )
         self.scroll_list.pack(fill="both", expand=True, padx=24, pady=(0, 16))
 
@@ -1462,15 +2576,17 @@ class ProjectHistoryDialog(ctk.CTkToplevel):
             ctk.CTkButton(
                 footer,
                 text=t_clr,
+                image=getattr(self.parent_app, "icon_trash", None),
+                compound="left",
                 command=self._on_clear_clicked,
                 height=34,
                 font=ctk.CTkFont(size=12),
-                fg_color=BG_CARD_INNER,
-                hover_color=("#FEE2E2", "#341B1B"),
+                fg_color=("#FEF2F2", "#221316"),
+                hover_color=("#FEE2E2", "#351A1E"),
                 text_color=("#DC2626", "#F87171"),
                 border_width=1,
-                border_color=BORDER_CARD,
-                corner_radius=6
+                border_color=("#FCA5A5", "#4B1B21"),
+                corner_radius=8
             ).pack(side="left")
 
         t_close = "Zavřít" if self.current_lang == "cs" else "Close"
@@ -1484,16 +2600,16 @@ class ProjectHistoryDialog(ctk.CTkToplevel):
             fg_color=ORANGE_PRIMARY,
             hover_color=ORANGE_HOVER,
             text_color="#FFFFFF",
-            corner_radius=6
+            corner_radius=8
         ).pack(side="right")
 
     def _render_item(self, item: Dict):
         card = ctk.CTkFrame(
             self.scroll_list,
-            fg_color=BG_CARD_INNER,
-            corner_radius=10,
+            fg_color=("#FFFFFF", "#1E202B"),
+            corner_radius=12,
             border_width=1,
-            border_color=BORDER_CARD
+            border_color=("#CBD5E1", "#333748")
         )
         card.pack(fill="x", padx=8, pady=5)
 
@@ -1525,7 +2641,7 @@ class ProjectHistoryDialog(ctk.CTkToplevel):
             fg_color=ORANGE_PRIMARY,
             hover_color=ORANGE_HOVER,
             text_color="#FFFFFF",
-            corner_radius=6,
+            corner_radius=8,
             width=130
         )
         btn_open.pack(side="left", padx=(0, 6))
@@ -1535,16 +2651,18 @@ class ProjectHistoryDialog(ctk.CTkToplevel):
             btn_folder = ctk.CTkButton(
                 btns,
                 text=t_f,
+                image=getattr(self.parent_app, "icon_folder", None),
+                compound="left",
                 command=lambda p=Path(output_path).parent: self.parent_app._open_folder(p),
                 height=34,
-                width=66,
+                width=80,
                 font=ctk.CTkFont(size=11, weight="bold"),
-                fg_color=BG_CARD,
-                hover_color=("#E5E7EB", "#252834"),
+                fg_color=("#F1F5F9", "#282B3A"),
+                hover_color=("#E2E8F0", "#34384A"),
                 text_color=TEXT_TITLE,
                 border_width=1,
-                border_color=BORDER_CARD,
-                corner_radius=6
+                border_color=("#CBD5E1", "#3F455A"),
+                corner_radius=8
             )
             btn_folder.pack(side="left", padx=(0, 6))
 
@@ -1552,16 +2670,18 @@ class ProjectHistoryDialog(ctk.CTkToplevel):
         btn_del = ctk.CTkButton(
             btns,
             text=t_del,
+            image=getattr(self.parent_app, "icon_trash", None),
+            compound="left",
             command=lambda it=item: self._confirm_and_delete_item(it),
             height=34,
-            width=66,
+            width=80,
             font=ctk.CTkFont(size=11),
-            fg_color=BG_CARD,
-            hover_color=("#FEE2E2", "#3B1818"),
+            fg_color=("#FEF2F2", "#261517"),
+            hover_color=("#FEE2E2", "#38191C"),
             text_color=("#DC2626", "#F87171"),
             border_width=1,
-            border_color=BORDER_CARD,
-            corner_radius=6
+            border_color=("#FCA5A5", "#4D1D22"),
+            corner_radius=8
         )
         btn_del.pack(side="left")
 
@@ -1666,6 +2786,7 @@ class AutoClipApp(BaseApp):
 
     def __init__(self):
         super().__init__()
+        apply_inter_to_tk_fonts(self)
 
         # Configuration
         self.config = load_app_config()
@@ -1688,7 +2809,12 @@ class AutoClipApp(BaseApp):
 
         # Window settings
         self.title(self.tr("app_title"))
-        self.geometry("1080x860")
+        w, h = 1080, 860
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        x = max(20, (sw - w) // 2)
+        y = max(20, (sh - h) // 2)
+        self.geometry(f"{w}x{h}+{x}+{y}")
         self.minsize(1060, 720)
         self.configure(fg_color=BG_WINDOW)
         self._set_app_icon()
@@ -1710,6 +2836,23 @@ class AutoClipApp(BaseApp):
         self.settings_dialog = None
         self.current_view = "snapcut"
         self._dim_overlay: Optional[ctk.CTkFrame] = None
+
+        # Load user-crafted high quality icons from assets/icons/
+        self.icon_folder = load_app_icon("folder", (20, 20))
+        self.icon_folder_white = load_app_icon("folder", (20, 20), tint="white")
+        self.icon_check = load_app_icon("check", (20, 20))
+        self.icon_trash = load_app_icon("trash", (20, 20))
+        self.icon_reload = load_app_icon("reload", (20, 20))
+        self.icon_star = load_app_icon("star", (20, 20))
+        self.icon_play = load_app_icon("play", (20, 20))
+        self.icon_pause = load_app_icon("pause", (20, 20))
+        self.icon_expand = load_app_icon("expand", (20, 20))
+        self.icon_hourglass = load_app_icon("hourglass", (18, 18))
+        self.icon_lightbulb = load_app_icon("lightbulb", (18, 18))
+        self.icon_volume = load_app_icon("volume", (18, 18))
+        self.icon_facecam = load_app_icon("facecam", (18, 18))
+        self.icon_close = load_app_icon("close", (18, 18))
+        self.icon_info = load_app_icon("info", (20, 20))
 
         # Build Studio Shell: Left Sidebar + Right Pages Container
         self._build_app_shell()
@@ -1807,26 +2950,125 @@ class AutoClipApp(BaseApp):
     # Helper: Interactive (?) Help Button Builder
     # -------------------------------------------------------------------------
 
-    def _create_help_btn(self, parent_row, target_container=None, text: str = "", recommendation: Optional[str] = None) -> ctk.CTkButton:
+    def _create_help_btn(self, parent_row, target_container=None, text: str = "", recommendation: Optional[str] = None) -> ModernButton:
         """
         Creates a clean (?) hover button with a floating tooltip overlay.
         The text floats cleanly next to the button on hover without shifting or jumping
         any widgets below, with a distinct bold warm-tinted recommendation badge.
         """
-        btn = ctk.CTkButton(
+        btn = ModernButton(
             parent_row,
             text="?",
             width=22,
             height=22,
             corner_radius=11,
+            circle_mode=True,
             font=ctk.CTkFont(size=11, weight="bold"),
             fg_color=("#E5E7EB", "#262833"),
             hover_color=ORANGE_PRIMARY,
-            text_color=("#4B5563", "#B4B9C7")
+            text_color=("#4B5568", "#B4B9C7"),
+            hover_text_color="#FFFFFF"
         )
         tooltip = ModernTooltip(btn, text=text, recommendation=recommendation)
         setattr(btn, "_tooltip", tooltip)
         return btn
+
+    _step_badge_cache: Dict[str, ctk.CTkImage] = {}
+
+    def _get_step_badge_image(self, text: str) -> Optional[ctk.CTkImage]:
+        if text in self._step_badge_cache:
+            return self._step_badge_cache[text]
+
+        base_dir = get_base_dir()
+        icons_dir = base_dir / "assets" / "icons"
+        assets_dir = base_dir / "assets"
+        custom_candidates = [
+            icons_dir / "steps" / f"step_{text}.png",
+            icons_dir / "steps" / f"step{text}.png",
+            icons_dir / f"step_{text}.png",
+            icons_dir / f"step{text}.png",
+            assets_dir / f"step_{text}.png",
+            assets_dir / f"step{text}.png"
+        ]
+        for c in custom_candidates:
+            if c.is_file():
+                try:
+                    img = Image.open(c).convert("RGBA")
+                    ci = ctk.CTkImage(light_image=img, dark_image=img, size=(30, 30))
+                    self._step_badge_cache[text] = ci
+                    return ci
+                except Exception:
+                    pass
+
+        try:
+            size = 30
+            scale = 4
+            s = size * scale
+            circle_pad = 4
+            r_box = [circle_pad, circle_pad, s - 1 - circle_pad, s - 1 - circle_pad]
+
+            font_path = assets_dir / "fonts" / "Inter-Bold.ttf"
+            f_size = int(17 * scale)
+            try:
+                font = ImageFont.truetype(str(font_path), f_size)
+            except Exception:
+                try:
+                    font = ImageFont.truetype("arialbd.ttf", f_size)
+                except Exception:
+                    font = ImageFont.load_default()
+
+            tmp = Image.new("RGBA", (s * 2, s * 2), (0, 0, 0, 0))
+            ImageDraw.Draw(tmp).text((s, s), text, fill=(255, 255, 255, 255), font=font)
+            gb = tmp.getbbox()
+            if gb:
+                gw = gb[2] - gb[0]
+                gh = gb[3] - gb[1]
+                tx = (s - gw) // 2 - (gb[0] - s)
+                ty = (s - gh) // 2 - (gb[1] - s)
+            else:
+                tx = ty = 0
+
+            img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+            d = ImageDraw.Draw(img)
+            d.ellipse(r_box, fill=(255, 87, 34, 255))
+            d.text((tx, ty), text, fill=(255, 255, 255, 255), font=font)
+
+            res = img.resize((size, size), Image.Resampling.LANCZOS)
+            ci = ctk.CTkImage(light_image=res, dark_image=res, size=(size, size))
+            self._step_badge_cache[text] = ci
+            return ci
+        except Exception:
+            return None
+
+    def _create_step_badge(self, parent_row, text: str) -> ctk.CTkLabel:
+        """
+        Creates a crisp, perfectly circular step badge (1, 2, 3, etc.).
+        If custom PNGs exist in assets/icons/steps/step_{text}.png,
+        it automatically loads and uses them.
+        Otherwise dynamically renders an ultra-smooth high-DPI anti-aliased circular
+        badge with Inter Bold typography.
+        """
+        badge_img = self._get_step_badge_image(text)
+        if badge_img:
+            badge = ctk.CTkLabel(
+                parent_row,
+                text="",
+                image=badge_img,
+                fg_color="transparent"
+            )
+        else:
+            badge = ctk.CTkLabel(
+                parent_row,
+                text=text,
+                font=ctk.CTkFont(family=APP_FONT_FAMILY, size=15, weight="bold"),
+                fg_color=ORANGE_PRIMARY,
+                text_color="#FFFFFF",
+                corner_radius=15,
+                width=30,
+                height=30
+            )
+            badge._label.grid(padx=0)
+        return badge
 
     def _setup_smooth_scrolling(self):
         """
@@ -2036,15 +3278,11 @@ class AutoClipApp(BaseApp):
         )
         self.lbl_sidebar_modules.pack(anchor="w", padx=18, pady=(4, 6))
 
-        # Nav 1: SnapCut (Logi Options+ style with vertical accent indicator)
-        self.nav_row_snapcut = ctk.CTkFrame(self.sidebar_frame, height=40, corner_radius=8, fg_color=("#F0F2F5", "#1B1C24"))
+        # Nav 1: SnapCut (Modern pill tab)
+        self.nav_row_snapcut = ctk.CTkFrame(self.sidebar_frame, height=40, corner_radius=10, fg_color=("#FFEDE5", "#2C1E18"))
         self.nav_row_snapcut.pack(fill="x", padx=10, pady=2)
         self.nav_row_snapcut.pack_propagate(False)
         self.nav_row_pecicut = self.nav_row_snapcut
-
-        self.nav_ind_snapcut = ctk.CTkFrame(self.nav_row_snapcut, width=4, corner_radius=2, fg_color=ORANGE_PRIMARY)
-        self.nav_ind_snapcut.pack(side="left", fill="y", padx=(4, 8), pady=8)
-        self.nav_ind_pecicut = self.nav_ind_snapcut
 
         self.btn_nav_snapcut = ctk.CTkButton(
             self.nav_row_snapcut,
@@ -2052,11 +3290,11 @@ class AutoClipApp(BaseApp):
             anchor="w",
             font=ctk.CTkFont(size=13, weight="bold"),
             fg_color="transparent",
-            text_color=TEXT_TITLE,
+            text_color=ORANGE_PRIMARY,
             hover=False,
             command=lambda: self._switch_view("snapcut")
         )
-        self.btn_nav_snapcut.pack(side="left", fill="both", expand=True)
+        self.btn_nav_snapcut.pack(fill="both", expand=True, padx=14)
         self.btn_nav_pecicut = self.btn_nav_snapcut
 
         # System Section Label
@@ -2068,13 +3306,10 @@ class AutoClipApp(BaseApp):
         )
         self.lbl_sidebar_system.pack(anchor="w", padx=18, pady=(14, 6))
 
-        # Nav 2: Settings (Logi Options+ style)
-        self.nav_row_settings = ctk.CTkFrame(self.sidebar_frame, height=40, corner_radius=8, fg_color="transparent")
+        # Nav 2: Settings (Modern pill tab)
+        self.nav_row_settings = ctk.CTkFrame(self.sidebar_frame, height=40, corner_radius=10, fg_color="transparent")
         self.nav_row_settings.pack(fill="x", padx=10, pady=2)
         self.nav_row_settings.pack_propagate(False)
-
-        self.nav_ind_settings = ctk.CTkFrame(self.nav_row_settings, width=4, corner_radius=2, fg_color="transparent")
-        self.nav_ind_settings.pack(side="left", fill="y", padx=(4, 8), pady=8)
 
         self.btn_nav_settings = ctk.CTkButton(
             self.nav_row_settings,
@@ -2086,7 +3321,7 @@ class AutoClipApp(BaseApp):
             hover=False,
             command=lambda: self._switch_view("settings")
         )
-        self.btn_nav_settings.pack(side="left", fill="both", expand=True)
+        self.btn_nav_settings.pack(fill="both", expand=True, padx=14)
 
         self._setup_nav_hover_events()
 
@@ -2176,7 +3411,7 @@ class AutoClipApp(BaseApp):
         # ---------------------------------------------------------------------
         # 1. Barevný režim aplikace (Obrázky se skosením: Systémová / Bílá / Černá)
         # ---------------------------------------------------------------------
-        theme_card = ctk.CTkFrame(self.page_settings, corner_radius=10, fg_color=BG_CARD, border_width=1, border_color=BORDER_CARD)
+        theme_card = ctk.CTkFrame(self.page_settings, corner_radius=12, fg_color=BG_CARD, border_width=1, border_color=BORDER_CARD)
         theme_card.pack(fill="x", pady=(0, 12))
 
         self.lbl_theme_title = ctk.CTkLabel(
@@ -2238,7 +3473,7 @@ class AutoClipApp(BaseApp):
         # ---------------------------------------------------------------------
         # 2. Jazyk aplikace / Language
         # ---------------------------------------------------------------------
-        lang_card = ctk.CTkFrame(self.page_settings, corner_radius=10, fg_color=BG_CARD, border_width=1, border_color=BORDER_CARD)
+        lang_card = ctk.CTkFrame(self.page_settings, corner_radius=12, fg_color=BG_CARD, border_width=1, border_color=BORDER_CARD)
         lang_card.pack(fill="x", pady=(0, 12))
 
         self.lbl_lang_title = ctk.CTkLabel(
@@ -2257,7 +3492,7 @@ class AutoClipApp(BaseApp):
         )
         self.lbl_lang_sub.pack(anchor="w", padx=16, pady=(0, 10))
 
-        lang_box = ctk.CTkFrame(lang_card, fg_color=BG_CARD_INNER, corner_radius=8, border_width=1, border_color=BORDER_CARD)
+        lang_box = ctk.CTkFrame(lang_card, fg_color=BG_CARD_INNER, corner_radius=10, border_width=0)
         lang_box.pack(fill="x", padx=16, pady=(0, 16))
 
         l_inner = ctk.CTkFrame(lang_box, fg_color="transparent")
@@ -2276,7 +3511,7 @@ class AutoClipApp(BaseApp):
             values=["English", "Čeština"],
             command=self._on_language_select,
             width=180,
-            height=34
+            height=38
         )
         self.lang_menu.pack(side="right")
         self.lang_menu.set("English" if self.current_language == "en" else "Čeština")
@@ -2284,7 +3519,7 @@ class AutoClipApp(BaseApp):
         # ---------------------------------------------------------------------
         # 3. Výchozí export a chování složek
         # ---------------------------------------------------------------------
-        export_card = ctk.CTkFrame(self.page_settings, corner_radius=10, fg_color=BG_CARD, border_width=1, border_color=BORDER_CARD)
+        export_card = ctk.CTkFrame(self.page_settings, corner_radius=12, fg_color=BG_CARD, border_width=1, border_color=BORDER_CARD)
         export_card.pack(fill="x", pady=(0, 12))
 
         self.lbl_export_title = ctk.CTkLabel(
@@ -2304,7 +3539,7 @@ class AutoClipApp(BaseApp):
         self.lbl_export_sub.pack(anchor="w", padx=16, pady=(0, 10))
 
         # Folder location row
-        folder_box = ctk.CTkFrame(export_card, fg_color=BG_CARD_INNER, corner_radius=8, border_width=1, border_color=BORDER_CARD)
+        folder_box = ctk.CTkFrame(export_card, fg_color=BG_CARD_INNER, corner_radius=10, border_width=0)
         folder_box.pack(fill="x", padx=16, pady=(0, 10))
 
         f_inner = ctk.CTkFrame(folder_box, fg_color="transparent")
@@ -2336,6 +3571,8 @@ class AutoClipApp(BaseApp):
         self.btn_change_default_export = ctk.CTkButton(
             f_btn_row,
             text=self.tr("btn_set_export_folder"),
+            image=self.icon_folder,
+            compound="left",
             command=self._on_change_default_export,
             width=160,
             height=30,
@@ -2361,14 +3598,11 @@ class AutoClipApp(BaseApp):
 
         # Auto open checkbox
         self.auto_open_folder_var = ctk.BooleanVar(value=self.auto_open_folder)
-        self.chk_auto_open_folder = ctk.CTkCheckBox(
+        self.chk_auto_open_folder = ModernCheckBox(
             export_card,
             text=self.tr("chk_auto_open_folder"),
             variable=self.auto_open_folder_var,
             font=ctk.CTkFont(size=12, weight="bold"),
-            fg_color=ORANGE_PRIMARY,
-            hover_color=ORANGE_HOVER,
-            border_color=("#9CA3AF", "#3A3D4D"),
             text_color=TEXT_TITLE,
             command=self._on_toggle_auto_open
         )
@@ -2377,7 +3611,7 @@ class AutoClipApp(BaseApp):
         # ---------------------------------------------------------------------
         # 4. Údržba a dočasná data (Cache)
         # ---------------------------------------------------------------------
-        cache_card = ctk.CTkFrame(self.page_settings, corner_radius=10, fg_color=BG_CARD, border_width=1, border_color=BORDER_CARD)
+        cache_card = ctk.CTkFrame(self.page_settings, corner_radius=12, fg_color=BG_CARD, border_width=1, border_color=BORDER_CARD)
         cache_card.pack(fill="x", pady=(0, 12))
 
         self.lbl_cache_title = ctk.CTkLabel(
@@ -2396,7 +3630,7 @@ class AutoClipApp(BaseApp):
         )
         self.lbl_cache_sub.pack(anchor="w", padx=16, pady=(0, 12))
 
-        cache_box = ctk.CTkFrame(cache_card, fg_color=BG_CARD_INNER, corner_radius=8, border_width=1, border_color=BORDER_CARD)
+        cache_box = ctk.CTkFrame(cache_card, fg_color=BG_CARD_INNER, corner_radius=10, border_width=0)
         cache_box.pack(fill="x", padx=16, pady=(0, 16))
 
         c_inner = ctk.CTkFrame(cache_box, fg_color="transparent")
@@ -2424,22 +3658,25 @@ class AutoClipApp(BaseApp):
         self.btn_clean_cache = ctk.CTkButton(
             c_inner,
             text=self.tr("btn_clear_cache"),
+            image=self.icon_trash,
+            compound="left",
             command=self._on_clear_cache_click,
-            width=175,
-            height=32,
+            width=185,
+            height=34,
             font=ctk.CTkFont(size=12, weight="bold"),
             fg_color=("#FEE2E2", "#2B1616"),
             hover_color=("#FECACA", "#3E1E1E"),
             text_color=("#DC2626", "#FF6B6B"),
             border_width=1,
-            border_color=("#FCA5A5", "#5E2222")
+            border_color=("#FCA5A5", "#5E2222"),
+            corner_radius=8
         )
         self.btn_clean_cache.pack(side="right")
 
         # ---------------------------------------------------------------------
         # 6. Kontrola stažených součástí
         # ---------------------------------------------------------------------
-        comp_card = ctk.CTkFrame(self.page_settings, corner_radius=10, fg_color=BG_CARD, border_width=1, border_color=BORDER_CARD)
+        comp_card = ctk.CTkFrame(self.page_settings, corner_radius=12, fg_color=BG_CARD, border_width=1, border_color=BORDER_CARD)
         comp_card.pack(fill="x", pady=(0, 12))
 
         comp_hdr = ctk.CTkFrame(comp_card, fg_color="transparent")
@@ -2456,12 +3693,17 @@ class AutoClipApp(BaseApp):
         self.btn_recheck = ctk.CTkButton(
             comp_hdr,
             text=self.tr("btn_recheck"),
-            width=110,
-            height=28,
-            font=ctk.CTkFont(size=11, weight="bold"),
+            image=self.icon_reload,
+            compound="left",
+            width=120,
+            height=32,
+            font=ctk.CTkFont(size=12, weight="bold"),
             fg_color=("#E5E7EB", "#20222B"),
             hover_color=("#D1D5DB", "#2B2E3B"),
             text_color=TEXT_TITLE,
+            border_width=1,
+            border_color=BORDER_CARD,
+            corner_radius=8,
             command=self._refresh_settings_components
         )
         self.btn_recheck.pack(side="right")
@@ -2472,7 +3714,7 @@ class AutoClipApp(BaseApp):
         # ---------------------------------------------------------------------
         # 7. Verze aplikace a aktualizace
         # ---------------------------------------------------------------------
-        ver_card = ctk.CTkFrame(self.page_settings, corner_radius=10, fg_color=BG_CARD, border_width=1, border_color=BORDER_CARD)
+        ver_card = ctk.CTkFrame(self.page_settings, corner_radius=12, fg_color=BG_CARD, border_width=1, border_color=BORDER_CARD)
         ver_card.pack(fill="x", pady=(0, 12))
 
         ver_hdr = ctk.CTkFrame(ver_card, fg_color="transparent")
@@ -2498,6 +3740,7 @@ class AutoClipApp(BaseApp):
             fg_color=ORANGE_PRIMARY,
             hover_color=ORANGE_HOVER,
             text_color="#FFFFFF",
+            corner_radius=8,
             command=self._check_for_updates
         )
         self.btn_update.pack(side="left", padx=(0, 8))
@@ -2513,7 +3756,7 @@ class AutoClipApp(BaseApp):
             text_color=ORANGE_PRIMARY,
             border_width=1,
             border_color=BORDER_CARD,
-            corner_radius=6,
+            corner_radius=8,
             command=self._perform_auto_update
         )
         self.btn_install_update.pack(side="left")
@@ -2761,7 +4004,7 @@ class AutoClipApp(BaseApp):
         # --- Row 0: FFmpeg & FFprobe ---
         ffmpeg_path, ffprobe_path = get_ffmpeg_paths()
         ffmpeg_ok = bool(ffmpeg_path and ffprobe_path)
-        row0 = ctk.CTkFrame(self.comp_rows_frame, fg_color=BG_CARD_INNER, corner_radius=6, border_width=1, border_color=BORDER_CARD)
+        row0 = ctk.CTkFrame(self.comp_rows_frame, fg_color=BG_CARD_INNER, corner_radius=8, border_width=0)
         row0.pack(fill="x", pady=4)
         info0 = ctk.CTkFrame(row0, fg_color="transparent")
         info0.pack(side="left", fill="x", expand=True, padx=12, pady=8)
@@ -2769,7 +4012,7 @@ class AutoClipApp(BaseApp):
             ctk.CTkLabel(info0, text=self.tr("comp_ffmpeg_ok"), font=ctk.CTkFont(size=12, weight="bold"), text_color="#22C55E").pack(anchor="w")
             ctk.CTkLabel(info0, text=self.tr("comp_ffmpeg_desc_ok", name=ffmpeg_path.name if ffmpeg_path else ''), font=ctk.CTkFont(size=11), text_color=TEXT_BODY).pack(anchor="w")
         elif getattr(self, "_is_downloading_comp_ffmpeg", False):
-            ctk.CTkLabel(info0, text=f"⏳  {self.tr('comp_ffmpeg_downloading')}", font=ctk.CTkFont(size=12, weight="bold"), text_color=ORANGE_PRIMARY).pack(anchor="w")
+            ctk.CTkLabel(info0, text=f"  {self.tr('comp_ffmpeg_downloading')}", image=self.icon_hourglass, compound="left", font=ctk.CTkFont(size=12, weight="bold"), text_color=ORANGE_PRIMARY).pack(anchor="w")
             self._comp_ffmpeg_sub_lbl = ctk.CTkLabel(info0, text=getattr(self, "_comp_ffmpeg_last_msg", "Připojuji k serveru..."), font=ctk.CTkFont(size=11), text_color=TEXT_BODY)
             self._comp_ffmpeg_sub_lbl.pack(anchor="w")
             act_box0 = ctk.CTkFrame(row0, fg_color="transparent")
@@ -2787,7 +4030,7 @@ class AutoClipApp(BaseApp):
                 width=135, height=26,
                 font=ctk.CTkFont(size=11, weight="bold"),
                 fg_color=ORANGE_PRIMARY, hover_color=ORANGE_HOVER,
-                text_color="#FFFFFF", command=self._settings_download_ffmpeg_action
+                text_color="#FFFFFF", corner_radius=8, command=self._settings_download_ffmpeg_action
             ).pack(side="right", padx=12)
 
         # --- Row 1: Facecam AI modely ---
@@ -2797,7 +4040,7 @@ class AutoClipApp(BaseApp):
         fc = (mdir / "haarcascade_frontalface_default.xml").is_file()
         cnt = sum([yn, sm, fc])
         models_ok = (cnt == 3)
-        row1 = ctk.CTkFrame(self.comp_rows_frame, fg_color=BG_CARD_INNER, corner_radius=6, border_width=1, border_color=BORDER_CARD)
+        row1 = ctk.CTkFrame(self.comp_rows_frame, fg_color=BG_CARD_INNER, corner_radius=8, border_width=0)
         row1.pack(fill="x", pady=4)
         info1 = ctk.CTkFrame(row1, fg_color="transparent")
         info1.pack(side="left", fill="x", expand=True, padx=12, pady=8)
@@ -2805,7 +4048,7 @@ class AutoClipApp(BaseApp):
             ctk.CTkLabel(info1, text=self.tr("comp_models_ok"), font=ctk.CTkFont(size=12, weight="bold"), text_color="#22C55E").pack(anchor="w")
             ctk.CTkLabel(info1, text=self.tr("comp_models_desc_ok"), font=ctk.CTkFont(size=11), text_color=TEXT_BODY).pack(anchor="w")
         elif getattr(self, "_is_downloading_comp_models", False):
-            ctk.CTkLabel(info1, text=f"⏳  {self.tr('comp_models_downloading')}", font=ctk.CTkFont(size=12, weight="bold"), text_color=ORANGE_PRIMARY).pack(anchor="w")
+            ctk.CTkLabel(info1, text=f"  {self.tr('comp_models_downloading')}", image=self.icon_hourglass, compound="left", font=ctk.CTkFont(size=12, weight="bold"), text_color=ORANGE_PRIMARY).pack(anchor="w")
             self._comp_models_sub_lbl = ctk.CTkLabel(info1, text=getattr(self, "_comp_models_last_msg", "Připojuji k serveru..."), font=ctk.CTkFont(size=11), text_color=TEXT_BODY)
             self._comp_models_sub_lbl.pack(anchor="w")
             act_box1 = ctk.CTkFrame(row1, fg_color="transparent")
@@ -2823,11 +4066,11 @@ class AutoClipApp(BaseApp):
                 width=135, height=26,
                 font=ctk.CTkFont(size=11, weight="bold"),
                 fg_color=ORANGE_PRIMARY, hover_color=ORANGE_HOVER,
-                text_color="#FFFFFF", command=self._settings_download_models_action
+                text_color="#FFFFFF", corner_radius=8, command=self._settings_download_models_action
             ).pack(side="right", padx=12)
 
         # --- Row 2: Pracovní adresáře ---
-        row2 = ctk.CTkFrame(self.comp_rows_frame, fg_color=BG_CARD_INNER, corner_radius=6, border_width=1, border_color=BORDER_CARD)
+        row2 = ctk.CTkFrame(self.comp_rows_frame, fg_color=BG_CARD_INNER, corner_radius=8, border_width=0)
         row2.pack(fill="x", pady=4)
         info2 = ctk.CTkFrame(row2, fg_color="transparent")
         info2.pack(side="left", fill="x", expand=True, padx=12, pady=8)
@@ -2835,11 +4078,11 @@ class AutoClipApp(BaseApp):
         ctk.CTkLabel(info2, text=self.tr("comp_dirs_desc"), font=ctk.CTkFont(size=11), text_color=TEXT_BODY).pack(anchor="w")
 
     def _setup_nav_hover_events(self):
-        """Binds responsive hover highlighting across navigation rows and child widgets in Logi Options+ style."""
-        def bind_row(row, ind, btn, vname):
+        """Binds responsive hover highlighting across navigation rows."""
+        def bind_row(row, btn, vname):
             def on_enter(_):
                 if getattr(self, "current_view", None) != vname:
-                    row.configure(fg_color=("#E5E7EB", "#181920"))
+                    row.configure(fg_color=("#F3F4F6", "#202330"))
                     btn.configure(text_color=TEXT_TITLE)
             def on_leave(_):
                 if getattr(self, "current_view", None) != vname:
@@ -2848,28 +4091,26 @@ class AutoClipApp(BaseApp):
             def on_click(_):
                 self._switch_view(vname)
 
-            for w in (row, ind, btn):
+            for w in (row, btn):
                 w.bind("<Enter>", on_enter)
                 w.bind("<Leave>", on_leave)
                 w.bind("<Button-1>", on_click)
 
-        bind_row(self.nav_row_snapcut, self.nav_ind_snapcut, self.btn_nav_snapcut, "snapcut")
-        bind_row(self.nav_row_settings, self.nav_ind_settings, self.btn_nav_settings, "settings")
+        bind_row(self.nav_row_snapcut, self.btn_nav_snapcut, "snapcut")
+        bind_row(self.nav_row_settings, self.btn_nav_settings, "settings")
 
     def _switch_view(self, view_name: str):
-        """Switches the active view in Pecislav Studio between SnapCut and Nastavení in Logi Options+ style."""
+        """Switches the active view in Pecislav Studio between SnapCut and Nastavení."""
         if view_name == "pecicut":
             view_name = "snapcut"
         self.current_view = view_name
         if view_name == "snapcut":
             self.page_settings.pack_forget()
             self.page_snapcut.pack(fill="both", expand=True, padx=20, pady=12)
-            if hasattr(self, "nav_ind_snapcut"):
-                self.nav_ind_snapcut.configure(fg_color=ORANGE_PRIMARY)
-                self.nav_row_snapcut.configure(fg_color=("#F0F2F5", "#1B1C24"))
-                self.btn_nav_snapcut.configure(text_color=TEXT_TITLE)
+            if hasattr(self, "nav_row_snapcut"):
+                self.nav_row_snapcut.configure(fg_color=("#FFEDE5", "#2C1E18"))
+                self.btn_nav_snapcut.configure(text_color=ORANGE_PRIMARY)
 
-                self.nav_ind_settings.configure(fg_color="transparent")
                 self.nav_row_settings.configure(fg_color="transparent")
                 self.btn_nav_settings.configure(text_color=TEXT_MUTED)
 
@@ -2878,12 +4119,10 @@ class AutoClipApp(BaseApp):
         elif view_name == "settings":
             self.page_snapcut.pack_forget()
             self.page_settings.pack(fill="both", expand=True, padx=20, pady=12)
-            if hasattr(self, "nav_ind_settings"):
-                self.nav_ind_settings.configure(fg_color=ORANGE_PRIMARY)
-                self.nav_row_settings.configure(fg_color=("#F0F2F5", "#1B1C24"))
-                self.btn_nav_settings.configure(text_color=TEXT_TITLE)
+            if hasattr(self, "nav_row_settings"):
+                self.nav_row_settings.configure(fg_color=("#FFEDE5", "#2C1E18"))
+                self.btn_nav_settings.configure(text_color=ORANGE_PRIMARY)
 
-                self.nav_ind_snapcut.configure(fg_color="transparent")
                 self.nav_row_snapcut.configure(fg_color="transparent")
                 self.btn_nav_snapcut.configure(text_color=TEXT_MUTED)
 
@@ -2958,8 +4197,8 @@ class AutoClipApp(BaseApp):
         for name in comps:
             row = ctk.CTkFrame(
                 self.comp_rows_frame,
-                fg_color=loading_bg, corner_radius=6,
-                border_width=1, border_color=BORDER_CARD
+                fg_color=loading_bg, corner_radius=8,
+                border_width=0
             )
             row.pack(fill="x", pady=4)
             info = ctk.CTkFrame(row, fg_color="transparent")
@@ -3452,13 +4691,18 @@ del "%~f0"
         box = ctk.CTkFrame(parent, corner_radius=12, fg_color=BG_CARD, border_width=1, border_color=BORDER_CARD)
         box.pack(fill="x", pady=8)
 
-        # Header row with title, ? button, and Project History button
+        # Header row with step badge, title, ? button, and Project History button
         hdr = ctk.CTkFrame(box, fg_color="transparent")
         hdr.pack(fill="x", padx=16, pady=(14, 6))
 
+        step_badge = self._create_step_badge(hdr, "1")
+        step_badge.pack(side="left", padx=(0, 8))
+
+        raw_title = self.tr("sec_file_title")
+        t_clean = raw_title.split(". ", 1)[-1] if ". " in raw_title else raw_title
         self.lbl_sec_file = ctk.CTkLabel(
             hdr,
-            text=self.tr("sec_file_title"),
+            text=t_clean,
             font=ctk.CTkFont(size=15, weight="bold"),
             text_color=TEXT_TITLE
         )
@@ -3476,7 +4720,7 @@ del "%~f0"
         q_btn.pack(side="left", padx=(8, 0))
 
         t_hist = "Historie projektů" if self.current_language == "cs" else "Project History"
-        self.btn_open_history = ctk.CTkButton(
+        self.btn_open_history = ModernButton(
             hdr,
             text=t_hist,
             command=self._open_history_dialog,
@@ -3488,7 +4732,7 @@ del "%~f0"
             text_color=ORANGE_PRIMARY,
             border_width=1,
             border_color=BORDER_CARD,
-            corner_radius=6
+            corner_radius=8
         )
         self.btn_open_history.pack(side="right")
 
@@ -3496,9 +4740,8 @@ del "%~f0"
         self.drop_zone = ctk.CTkFrame(
             box,
             fg_color=BG_CARD_INNER,
-            corner_radius=10,
-            border_width=1,
-            border_color=BORDER_CARD
+            corner_radius=12,
+            border_width=0
         )
         self.drop_zone.pack(fill="x", padx=16, pady=(4, 12))
 
@@ -3506,20 +4749,21 @@ del "%~f0"
         drop_inner.pack(fill="x", padx=16, pady=12)
 
         has_video = bool(self.current_video_path)
-        btn_txt = self.tr("btn_change_file") if has_video else self.tr("btn_select_file")
-        self.btn_select_file = ctk.CTkButton(
+        btn_txt = self.tr('btn_change_file') if has_video else self.tr('btn_select_file')
+        self.btn_select_file = ModernButton(
             drop_inner,
             text=btn_txt,
+            image=self.icon_folder_white,
+            compound="left",
             command=self._on_select_file,
-            width=180,
+            width=175,
             height=38,
             font=ctk.CTkFont(size=13, weight="bold"),
-            fg_color=BG_CARD if has_video else ORANGE_PRIMARY,
-            hover_color=("#E5E7EB", "#2B2E3B") if has_video else ORANGE_HOVER,
-            border_width=1 if has_video else 0,
-            border_color=BORDER_SUBTLE if has_video else ORANGE_PRIMARY,
-            text_color=TEXT_TITLE if has_video else "#FFFFFF",
-            corner_radius=8
+            fg_color=ORANGE_PRIMARY,
+            hover_color=ORANGE_HOVER,
+            border_width=0,
+            text_color="#FFFFFF",
+            corner_radius=10
         )
         self.btn_select_file.pack(side="left")
 
@@ -3544,19 +4788,21 @@ del "%~f0"
         )
         self.lbl_dnd_hint.pack(anchor="w", pady=(2, 0))
 
-        # Register Drag & Drop targets across the main window
+        # Register Drag & Drop targets across the main window and drop zone
         if getattr(self, "_dnd_ready", False) and DND_FILES is not None:
-            try:
-                self.drop_target_register(DND_FILES)
-                self.dnd_bind('<<Drop>>', self._on_file_drop)
-                self.dnd_bind('<<DropEnter>>', self._on_drop_enter)
-                self.dnd_bind('<<DropPosition>>', self._on_drop_position)
-                self.dnd_bind('<<DropLeave>>', self._on_drop_leave)
-            except Exception:
-                pass
+            # Register only self and drop_zone to prevent false leave events between nested child widgets
+            for target in [self, self.drop_zone]:
+                try:
+                    target.drop_target_register(DND_FILES)
+                    target.dnd_bind('<<Drop>>', self._on_file_drop)
+                    target.dnd_bind('<<DropEnter>>', self._on_drop_enter)
+                    target.dnd_bind('<<DropPosition>>', self._on_drop_position)
+                    target.dnd_bind('<<DropLeave>>', self._on_drop_leave)
+                except Exception:
+                    pass
 
         # Video metadata summary card
-        self.meta_card = ctk.CTkFrame(box, fg_color=BG_CARD_INNER, corner_radius=8, border_width=1, border_color=BORDER_CARD)
+        self.meta_card = ctk.CTkFrame(box, fg_color=BG_CARD_INNER, corner_radius=12, border_width=0)
         self.meta_card.pack(fill="x", padx=16, pady=(0, 14))
 
         self.lbl_meta_info = ctk.CTkLabel(
@@ -3568,7 +4814,7 @@ del "%~f0"
         )
         self.lbl_meta_info.pack(padx=12, pady=8, anchor="w")
 
-    def _is_cursor_over_drop_zone(self, event) -> bool:
+    def _is_cursor_over_drop_zone(self, event=None) -> bool:
         if not hasattr(self, "drop_zone") or not self.drop_zone.winfo_exists():
             return False
         try:
@@ -3576,15 +4822,20 @@ del "%~f0"
             ry = self.drop_zone.winfo_rooty()
             rw = self.drop_zone.winfo_width()
             rh = self.drop_zone.winfo_height()
-            x = getattr(event, "x_root", None)
-            y = getattr(event, "y_root", None)
+            x = getattr(event, "x_root", None) if event is not None else None
+            y = getattr(event, "y_root", None) if event is not None else None
             if x is None or y is None:
-                return True
+                try:
+                    x, y = self.winfo_pointerxy()
+                except Exception:
+                    return False
             return (rx <= x <= rx + rw) and (ry <= y <= ry + rh)
         except Exception:
             return False
 
     def _set_drop_zone_highlight(self, active: bool):
+        if getattr(self, "_dnd_hover_active", None) == active:
+            return
         self._dnd_hover_active = active
         if not hasattr(self, "drop_zone") or not self.drop_zone.winfo_exists():
             return
@@ -3609,15 +4860,14 @@ del "%~f0"
             self._update_drop_zone_labels()
 
     def _on_drop_enter(self, event=None):
-        if event is not None and self._is_cursor_over_drop_zone(event):
-            self._set_drop_zone_highlight(True)
+        over = self._is_cursor_over_drop_zone(event)
+        self._set_drop_zone_highlight(over)
         return getattr(event, "action", "copy") if event else "copy"
 
     def _on_drop_position(self, event=None):
         if event is not None:
             over = self._is_cursor_over_drop_zone(event)
-            if over != getattr(self, "_dnd_hover_active", False):
-                self._set_drop_zone_highlight(over)
+            self._set_drop_zone_highlight(over)
         return getattr(event, "action", "copy") if event else "copy"
 
     def _on_drop_leave(self, event=None):
@@ -3642,11 +4892,11 @@ del "%~f0"
             if hasattr(self, "btn_select_file"):
                 self.btn_select_file.configure(
                     text=self.tr("btn_change_file"),
-                    fg_color=BG_CARD,
-                    hover_color=("#E5E7EB", "#2B2E3B"),
-                    border_width=1,
-                    border_color=BORDER_SUBTLE,
-                    text_color=TEXT_TITLE
+                    image=self.icon_folder_white,
+                    fg_color=ORANGE_PRIMARY,
+                    hover_color=ORANGE_HOVER,
+                    border_width=0,
+                    text_color="#FFFFFF"
                 )
         else:
             if hasattr(self, "lbl_file_path"):
@@ -3656,6 +4906,7 @@ del "%~f0"
             if hasattr(self, "btn_select_file"):
                 self.btn_select_file.configure(
                     text=self.tr("btn_select_file"),
+                    image=self.icon_folder_white,
                     fg_color=ORANGE_PRIMARY,
                     hover_color=ORANGE_HOVER,
                     border_width=0,
@@ -3676,7 +4927,7 @@ del "%~f0"
         if not candidates:
             return getattr(event, "action", "copy") if event else "copy"
 
-        candidate = candidates[0].strip()
+        candidate = str(candidates[0]).strip().strip("{}'\"")
         p = Path(candidate)
         if not p.is_file():
             messagebox.showwarning(
@@ -3732,9 +4983,10 @@ del "%~f0"
 
             ctk.CTkLabel(
                 card,
-                text="◈",
-                font=ctk.CTkFont(size=20, weight="bold"),
-                text_color=ORANGE_PRIMARY
+                text="",
+                image=self.icon_info,
+                width=32,
+                height=32
             ).pack(padx=40, pady=(22, 2))
 
             ctk.CTkLabel(
@@ -4010,15 +5262,20 @@ del "%~f0"
 
     def _build_audio_track_section(self, parent):
         """2. Audio track dropdown menu."""
-        box = ctk.CTkFrame(parent, corner_radius=10, fg_color=BG_CARD, border_width=1, border_color=BORDER_CARD)
+        box = ctk.CTkFrame(parent, corner_radius=12, fg_color=BG_CARD, border_width=1, border_color=BORDER_CARD)
         box.pack(fill="x", pady=8)
 
         hdr = ctk.CTkFrame(box, fg_color="transparent")
         hdr.pack(fill="x", padx=16, pady=(12, 4))
 
+        step_badge = self._create_step_badge(hdr, "2")
+        step_badge.pack(side="left", padx=(0, 8))
+
+        raw_title = self.tr("sec_audio_title")
+        t_clean = raw_title.split(". ", 1)[-1] if ". " in raw_title else raw_title
         self.lbl_sec_audio = ctk.CTkLabel(
             hdr,
-            text=self.tr("sec_audio_title"),
+            text=t_clean,
             font=ctk.CTkFont(size=15, weight="bold"),
             text_color=TEXT_TITLE
         )
@@ -4049,23 +5306,27 @@ del "%~f0"
             box,
             values=["Stopa 1 (výchozí)"],
             variable=self.audio_track_var,
-            width=540,
-            height=36
+            height=38
         )
-        self.audio_dropdown.pack(anchor="w", padx=16, pady=(0, 14))
+        self.audio_dropdown.pack(fill="x", padx=16, pady=(0, 14))
 
     def _build_parameters_section(self, parent):
         """3. Mode Selection, Sliders, and Target Video Duration."""
-        box = ctk.CTkFrame(parent, corner_radius=10, fg_color=BG_CARD, border_width=1, border_color=BORDER_CARD)
+        box = ctk.CTkFrame(parent, corner_radius=12, fg_color=BG_CARD, border_width=1, border_color=BORDER_CARD)
         box.pack(fill="x", pady=8)
 
         # 3.1 Mode Header
         hdr = ctk.CTkFrame(box, fg_color="transparent")
         hdr.pack(fill="x", padx=16, pady=(12, 4))
 
+        step_badge = self._create_step_badge(hdr, "3")
+        step_badge.pack(side="left", padx=(0, 8))
+
+        raw_title = self.tr("sec_params_title")
+        t_clean = raw_title.split(". ", 1)[-1] if ". " in raw_title else raw_title
         self.lbl_sec_params = ctk.CTkLabel(
             hdr,
-            text=self.tr("sec_params_title"),
+            text=t_clean,
             font=ctk.CTkFont(size=15, weight="bold"),
             text_color=TEXT_TITLE
         )
@@ -4086,23 +5347,22 @@ del "%~f0"
         # Mode dropdown
         saved_mode = self.config.get("detection_mode", "highlights")
         if saved_mode == "silence":
-            init_mode = "Vyrézat pouze ticho (plná délka bez dlouhých pauz)"
+            init_mode = "Vyřezat pouze ticho (plná délka bez dlouhých pauz)"
         else:
-            init_mode = "Pouze akcni highlighty (sestřih křiku a reakcí)"
+            init_mode = "Pouze akční highlighty (sestřih křiku a reakcí)"
 
         self.mode_var = ctk.StringVar(value=init_mode)
         self.mode_dropdown = ModernOptionMenu(
             box,
             values=[
-                "Pouze akcni highlighty (sestřih křiku a reakcí)",
-                "Vyrézat pouze ticho (plná délka bez dlouhých pauz)"
+                "Pouze akční highlighty (sestřih křiku a reakcí)",
+                "Vyřezat pouze ticho (plná délka bez dlouhých pauz)"
             ],
             variable=self.mode_var,
             command=self._on_mode_dropdown_change,
-            width=540,
-            height=36
+            height=38
         )
-        self.mode_dropdown.pack(anchor="w", padx=16, pady=(0, 10))
+        self.mode_dropdown.pack(fill="x", padx=16, pady=(0, 10))
 
         # 3.2 Target Video Duration
         dur_hdr = ctk.CTkFrame(box, fg_color="transparent")
@@ -4152,19 +5412,31 @@ del "%~f0"
             values=dur_labels,
             variable=self.target_dur_var,
             command=lambda _: self._queue_save_settings(),
-            width=540,
-            height=36
+            height=38
         )
-        self.target_dur_dropdown.pack(anchor="w", padx=16, pady=(2, 10))
+        self.target_dur_dropdown.pack(fill="x", padx=16, pady=(2, 10))
 
         # 3.3 Slider 1: Loudness Threshold dBFS
         s1_frame = ctk.CTkFrame(box, fg_color="transparent")
         s1_frame.pack(fill="x", padx=16, pady=4)
 
+        saved_thresh = float(self.config.get("sound_threshold", -14.0))
+        self.lbl_threshold_val = ctk.CTkLabel(
+            s1_frame,
+            text=f"{saved_thresh:.1f} dBFS",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color=ORANGE_ACCENT_TEXT,
+            fg_color=CHIP_BG,
+            corner_radius=6,
+            height=24,
+            padx=8
+        )
+        self.lbl_threshold_val.pack(side="right")
+
         self.lbl_thresh_heading = ctk.CTkLabel(
             s1_frame,
             text=self.tr("lbl_threshold"),
-            font=ctk.CTkFont(size=13, weight="bold"),
+            font=ctk.CTkFont(size=12, weight="bold"),
             text_color=TEXT_TITLE
         )
         self.lbl_thresh_heading.pack(side="left")
@@ -4182,16 +5454,7 @@ del "%~f0"
         )
         self.q_thresh.pack(side="left", padx=(8, 0))
 
-        saved_thresh = float(self.config.get("sound_threshold", -14.0))
-        self.lbl_threshold_val = ctk.CTkLabel(
-            s1_frame,
-            text=f"{saved_thresh:.1f} dBFS",
-            font=ctk.CTkFont(size=13, weight="bold"),
-            text_color=ORANGE_ACCENT_TEXT
-        )
-        self.lbl_threshold_val.pack(side="right")
-
-        self.slider_threshold = ctk.CTkSlider(
+        self.slider_threshold = ModernSlider(
             box,
             from_=-35,
             to=-5,
@@ -4216,6 +5479,20 @@ del "%~f0"
 
         p_before_hdr = ctk.CTkFrame(pad_left, fg_color="transparent")
         p_before_hdr.pack(fill="x")
+
+        saved_pad_b = float(self.config.get("pad_before", 4.0))
+        self.lbl_pad_before = ctk.CTkLabel(
+            p_before_hdr,
+            text=f"{saved_pad_b:.1f} s",
+            text_color=ORANGE_ACCENT_TEXT,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            fg_color=CHIP_BG,
+            corner_radius=6,
+            height=24,
+            padx=8
+        )
+        self.lbl_pad_before.pack(side="right")
+
         self.lbl_pad_before_heading = ctk.CTkLabel(p_before_hdr, text=self.tr("lbl_pad_before"), font=ctk.CTkFont(size=12, weight="bold"), text_color=TEXT_TITLE)
         self.lbl_pad_before_heading.pack(side="left")
         q_p_bef = self._create_help_btn(
@@ -4228,11 +5505,7 @@ del "%~f0"
         )
         q_p_bef.pack(side="left", padx=(6, 0))
 
-        saved_pad_b = float(self.config.get("pad_before", 4.0))
-        self.lbl_pad_before = ctk.CTkLabel(p_before_hdr, text=f"{saved_pad_b:.1f} s", text_color=ORANGE_ACCENT_TEXT, font=ctk.CTkFont(size=12, weight="bold"))
-        self.lbl_pad_before.pack(side="right")
-
-        self.slider_pad_before = ctk.CTkSlider(
+        self.slider_pad_before = ModernSlider(
             pad_left,
             from_=0,
             to=10,
@@ -4253,6 +5526,20 @@ del "%~f0"
 
         p_after_hdr = ctk.CTkFrame(pad_right, fg_color="transparent")
         p_after_hdr.pack(fill="x")
+
+        saved_pad_a = float(self.config.get("pad_after", 2.0))
+        self.lbl_pad_after = ctk.CTkLabel(
+            p_after_hdr,
+            text=f"{saved_pad_a:.1f} s",
+            text_color=ORANGE_ACCENT_TEXT,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            fg_color=CHIP_BG,
+            corner_radius=6,
+            height=24,
+            padx=8
+        )
+        self.lbl_pad_after.pack(side="right")
+
         self.lbl_pad_after_heading = ctk.CTkLabel(p_after_hdr, text=self.tr("lbl_pad_after"), font=ctk.CTkFont(size=12, weight="bold"), text_color=TEXT_TITLE)
         self.lbl_pad_after_heading.pack(side="left")
         q_p_aft = self._create_help_btn(
@@ -4265,11 +5552,7 @@ del "%~f0"
         )
         q_p_aft.pack(side="left", padx=(6, 0))
 
-        saved_pad_a = float(self.config.get("pad_after", 2.0))
-        self.lbl_pad_after = ctk.CTkLabel(p_after_hdr, text=f"{saved_pad_a:.1f} s", text_color=ORANGE_ACCENT_TEXT, font=ctk.CTkFont(size=12, weight="bold"))
-        self.lbl_pad_after.pack(side="right")
-
-        self.slider_pad_after = ctk.CTkSlider(
+        self.slider_pad_after = ModernSlider(
             pad_right,
             from_=0,
             to=10,
@@ -4290,6 +5573,20 @@ del "%~f0"
 
         gap_hdr = ctk.CTkFrame(gap_frame, fg_color="transparent")
         gap_hdr.pack(fill="x")
+
+        saved_gap = float(self.config.get("min_gap", 2.0))
+        self.lbl_gap_val = ctk.CTkLabel(
+            gap_hdr,
+            text=f"{saved_gap:.1f} s",
+            text_color=ORANGE_ACCENT_TEXT,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            fg_color=CHIP_BG,
+            corner_radius=6,
+            height=24,
+            padx=8
+        )
+        self.lbl_gap_val.pack(side="right")
+
         self.lbl_gap_heading = ctk.CTkLabel(
             gap_hdr,
             text=self.tr("lbl_gap"),
@@ -4299,7 +5596,7 @@ del "%~f0"
         self.lbl_gap_heading.pack(side="left")
 
         q_gap = self._create_help_btn(
-            gap_frame,
+            gap_hdr,
             text=(
                 "Pokud se dvě hlasité reakce odehrají těsně za sebou (např. se zasmějete, na 1 sekundu se nadechnete "
                 "a znovu zařvete), SnapCut tyto momenty automaticky spojí do jednoho plynulého klipu.\n\n"
@@ -4309,11 +5606,7 @@ del "%~f0"
         )
         q_gap.pack(side="left", padx=(6, 0))
 
-        saved_gap = float(self.config.get("min_gap", 2.0))
-        self.lbl_gap_val = ctk.CTkLabel(gap_hdr, text=f"{saved_gap:.1f} s", text_color=ORANGE_ACCENT_TEXT, font=ctk.CTkFont(size=12, weight="bold"))
-        self.lbl_gap_val.pack(side="right")
-
-        self.slider_gap = ctk.CTkSlider(
+        self.slider_gap = ModernSlider(
             box,
             from_=0,
             to=6,
@@ -4329,7 +5622,7 @@ del "%~f0"
         self._disable_slider_mousewheel(self.slider_gap)
 
         # 3.6 Facecam AI Feature Card
-        facecam_box = ctk.CTkFrame(box, fg_color=BG_CARD_INNER, corner_radius=8, border_width=1, border_color=BORDER_CARD)
+        facecam_box = ctk.CTkFrame(box, fg_color=BG_CARD_INNER, corner_radius=10, border_width=0)
         facecam_box.pack(fill="x", padx=16, pady=(4, 12))
 
         f_hdr = ctk.CTkFrame(facecam_box, fg_color="transparent")
@@ -4337,15 +5630,12 @@ del "%~f0"
 
         saved_fc = bool(self.config.get("facecam_enabled", True))
         self.facecam_ai_var = ctk.BooleanVar(value=saved_fc)
-        self.chk_facecam_ai = ctk.CTkCheckBox(
+        self.chk_facecam_ai = ModernCheckBox(
             f_hdr,
             text=self.tr("chk_facecam"),
             variable=self.facecam_ai_var,
             command=self._queue_save_settings,
             font=ctk.CTkFont(size=13, weight="bold"),
-            fg_color=ORANGE_PRIMARY,
-            hover_color=ORANGE_HOVER,
-            border_color=("#9CA3AF", "#3A3D4D"),
             text_color=TEXT_TITLE
         )
         self.chk_facecam_ai.pack(side="left")
@@ -4375,15 +5665,20 @@ del "%~f0"
 
     def _build_export_section(self, parent):
         """4. Single-choice output format (Dropdown) and destination directory."""
-        box = ctk.CTkFrame(parent, corner_radius=10, fg_color=BG_CARD, border_width=1, border_color=BORDER_CARD)
+        box = ctk.CTkFrame(parent, corner_radius=12, fg_color=BG_CARD, border_width=1, border_color=BORDER_CARD)
         box.pack(fill="x", pady=8)
 
         hdr = ctk.CTkFrame(box, fg_color="transparent")
         hdr.pack(fill="x", padx=16, pady=(12, 4))
 
+        step_badge = self._create_step_badge(hdr, "4")
+        step_badge.pack(side="left", padx=(0, 8))
+
+        raw_title = self.tr("sec_export_title")
+        t_clean = raw_title.split(". ", 1)[-1] if ". " in raw_title else raw_title
         self.lbl_sec_export = ctk.CTkLabel(
             hdr,
-            text=self.tr("sec_export_title"),
+            text=t_clean,
             font=ctk.CTkFont(size=15, weight="bold"),
             text_color=TEXT_TITLE
         )
@@ -4413,15 +5708,14 @@ del "%~f0"
             ],
             variable=self.format_var,
             command=lambda _: self._queue_save_settings(),
-            width=540,
-            height=36
+            height=38
         )
-        self.format_dropdown.pack(anchor="w", padx=16, pady=(0, 12))
+        self.format_dropdown.pack(fill="x", padx=16, pady=(0, 12))
 
         # Output folder interactive card (Logi Options+ style)
         out_card = ctk.CTkFrame(
             box,
-            corner_radius=10,
+            corner_radius=12,
             fg_color=BG_CARD_INNER,
             border_width=1,
             border_color=BORDER_CARD
@@ -4429,13 +5723,14 @@ del "%~f0"
         out_card.pack(fill="x", padx=16, pady=(0, 14))
 
         out_inner = ctk.CTkFrame(out_card, fg_color="transparent")
-        out_inner.pack(fill="x", padx=12, pady=10)
+        out_inner.pack(fill="x", padx=12, pady=8)
 
         icon_lbl = ctk.CTkLabel(
             out_inner,
-            text="📁",
-            font=ctk.CTkFont(size=16),
+            text="",
+            image=self.icon_folder,
             width=26,
+            height=32,
             cursor="hand2"
         )
         icon_lbl.pack(side="left", padx=(0, 8))
@@ -4452,77 +5747,95 @@ del "%~f0"
             font=ctk.CTkFont(size=12),
             text_color=TEXT_TITLE if (self.default_export_dir and Path(self.default_export_dir).is_dir()) else TEXT_BODY,
             anchor="w",
+            height=32,
             cursor="hand2"
         )
         self.lbl_output_dir.pack(side="left", fill="x", expand=True)
         self.lbl_output_dir.bind("<Button-1>", lambda _: self._on_open_result_folder())
 
-        self.btn_reveal_out = ctk.CTkButton(
+        self.btn_reveal_out = ModernButton(
             out_inner,
             text=self.tr("btn_reveal_out"),
             command=self._on_open_result_folder,
-            width=110,
-            height=30,
-            corner_radius=6,
+            width=120,
+            height=36,
+            corner_radius=8,
             fg_color=BG_CARD,
             hover_color=("#E5E7EB", "#252834"),
             border_width=1,
             border_color=BORDER_CARD,
-            font=ctk.CTkFont(size=11, weight="bold"),
+            font=ctk.CTkFont(size=12, weight="bold"),
             text_color=TEXT_TITLE
         )
         self.btn_reveal_out.pack(side="right", padx=(6, 0))
 
-        self.btn_change_out = ctk.CTkButton(
+        self.btn_change_out = ModernButton(
             out_inner,
             text=self.tr("btn_change_out"),
             command=self._on_select_output_dir,
-            width=140,
-            height=30,
-            corner_radius=6,
+            width=180,
+            height=36,
+            corner_radius=8,
             fg_color=BG_CARD,
             hover_color=("#E5E7EB", "#252834"),
             border_width=1,
             border_color=BORDER_CARD,
-            font=ctk.CTkFont(size=11, weight="bold"),
+            font=ctk.CTkFont(size=12, weight="bold"),
             text_color=TEXT_TITLE
         )
         self.btn_change_out.pack(side="right", padx=(8, 0))
 
-        # Option A: Interactive review editor & preview checkbox
+        # Option A: Interactive review editor & preview checkbox (Styled identically to Facecam AI)
+        rev_box = ctk.CTkFrame(box, fg_color=BG_CARD_INNER, corner_radius=10, border_width=0)
+        rev_box.pack(fill="x", padx=16, pady=(0, 14))
+
+        rev_hdr = ctk.CTkFrame(rev_box, fg_color="transparent")
+        rev_hdr.pack(fill="x", padx=12, pady=(10, 4))
+
         saved_rev = bool(self.config.get("review_segments", True))
         self.review_segments_var = ctk.BooleanVar(value=saved_rev)
-        self.chk_review_segments = ctk.CTkCheckBox(
-            box,
+        self.chk_review_segments = ModernCheckBox(
+            rev_hdr,
             text=self.tr("chk_review_segments"),
             variable=self.review_segments_var,
             command=self._queue_save_settings,
-            font=ctk.CTkFont(size=12, weight="bold"),
-            fg_color=ORANGE_PRIMARY,
-            hover_color=ORANGE_HOVER,
-            border_color=("#9CA3AF", "#3A3D4D"),
+            font=ctk.CTkFont(size=13, weight="bold"),
             text_color=TEXT_TITLE
         )
-        self.chk_review_segments.pack(anchor="w", padx=16, pady=(2, 2))
+        self.chk_review_segments.pack(side="left")
+
+        q_rev = self._create_help_btn(
+            rev_hdr,
+            text=(
+                "Před samotným střihem a uložením videa otevře interaktivní vizuální studio:\n\n"
+                "• Zobrazí nalezené momenty a jejich délky\n"
+                "• Umožní přehrát a zkontrolovat jednotlivé reakce\n"
+                "• Můžete ručně vyřadit nebo přidat jednotlivé klipy"
+            ),
+            recommendation="Doporučeno nechat zapnuté, abyste měli plnou kontrolu nad finálním sestřihem."
+        )
+        q_rev.pack(side="left", padx=(8, 0))
 
         self.sub_review_segments = ctk.CTkLabel(
-            box,
+            rev_box,
             text=self.tr("sub_review_segments"),
             font=ctk.CTkFont(size=11),
-            text_color=TEXT_BODY
+            text_color=TEXT_BODY,
+            wraplength=700,
+            justify="left"
         )
-        self.sub_review_segments.pack(anchor="w", padx=16, pady=(0, 14))
+        self.sub_review_segments.pack(anchor="w", padx=42, pady=(0, 10))
 
     def _build_progress_section(self, parent):
         """Action button, progress bar, textual feedback, and results card."""
-        box = ctk.CTkFrame(parent, corner_radius=10, fg_color=BG_CARD, border_width=1, border_color=BORDER_CARD)
+        box = ctk.CTkFrame(parent, corner_radius=12, fg_color=BG_CARD, border_width=1, border_color=BORDER_CARD)
         box.pack(fill="x", pady=8)
 
         # Buttons row
         btn_row = ctk.CTkFrame(box, fg_color="transparent")
         btn_row.pack(fill="x", padx=16, pady=(14, 10))
 
-        self.btn_process = ctk.CTkButton(
+        self.btn_process = ModernButton(
             btn_row,
             text=self.tr("btn_process"),
             command=self._on_start_processing,
@@ -4530,11 +5843,12 @@ del "%~f0"
             font=ctk.CTkFont(size=15, weight="bold"),
             fg_color=ORANGE_PRIMARY,
             hover_color=ORANGE_HOVER,
-            text_color="#FFFFFF"
+            text_color="#FFFFFF",
+            corner_radius=8
         )
         self.btn_process.pack(side="left", fill="x", expand=True, padx=(0, 8))
 
-        self.btn_cancel = ctk.CTkButton(
+        self.btn_cancel = ModernButton(
             btn_row,
             text=self.tr("btn_cancel"),
             command=self._on_cancel_processing,
@@ -4546,12 +5860,13 @@ del "%~f0"
             text_color=("#DC2626", "#FF6B6B"),
             border_width=1,
             border_color=("#FCA5A5", "#5E2222"),
+            corner_radius=8,
             state="disabled"
         )
         self.btn_cancel.pack(side="right")
 
         # Progress bar
-        self.progress_bar = ctk.CTkProgressBar(box, height=14, fg_color=TRACK_COLOR, progress_color=ORANGE_PRIMARY)
+        self.progress_bar = ModernProgressBar(box, height=14, fg_color=TRACK_COLOR, progress_color=ORANGE_PRIMARY)
         self.progress_bar.pack(fill="x", padx=16, pady=(4, 6))
         self.progress_bar.set(0.0)
 
@@ -4578,7 +5893,7 @@ del "%~f0"
         # Result row (Hidden initially - minimal checkmark + folder link)
         self.result_card = ctk.CTkFrame(box, fg_color="transparent")
 
-        self.btn_open_folder = ctk.CTkButton(
+        self.btn_open_folder = ModernButton(
             self.result_card,
             text=self.tr("btn_open_folder"),
             command=self._on_open_result_folder,
@@ -4587,7 +5902,7 @@ del "%~f0"
             fg_color=ORANGE_PRIMARY,
             hover_color=ORANGE_HOVER,
             text_color="#FFFFFF",
-            corner_radius=6
+            corner_radius=8
         )
         self.btn_open_folder.pack(side="left", padx=(0, 14))
 
@@ -4666,7 +5981,9 @@ del "%~f0"
         self.is_downloading_ffmpeg = True
         if hasattr(self, "sidebar_ffmpeg_pill"):
             self.sidebar_ffmpeg_pill.configure(
-                text="⏳ Stahuji...",
+                text=" Stahuji...",
+                image=self.icon_hourglass,
+                compound="left",
                 border_color=ORANGE_PRIMARY,
                 text_color=ORANGE_PRIMARY
             )
@@ -4845,7 +6162,14 @@ del "%~f0"
         self.lbl_file_path.configure(text=disp_name, text_color=TEXT_TITLE)
 
         if hasattr(self, "btn_select_file"):
-            self.btn_select_file.configure(text=self.tr("btn_change_file"))
+            self.btn_select_file.configure(
+                text=self.tr("btn_change_file"),
+                image=self.icon_folder_white,
+                fg_color=ORANGE_PRIMARY,
+                hover_color=ORANGE_HOVER,
+                border_width=0,
+                text_color="#FFFFFF"
+            )
 
         if hasattr(self, "lbl_dnd_hint"):
             try:
@@ -4904,7 +6228,7 @@ del "%~f0"
             f"Délka: {dur_str}  |  FPS: {fps:.2f}  |  Rozlišení: {w}x{h_res}  |  "
             f"Video Codec: {codec}  |  Audio stop: {len(tracks)}"
         )
-        self.lbl_meta_info.configure(text=info_text, text_color=ORANGE_ACCENT_TEXT)
+        self.lbl_meta_info.configure(text=info_text, text_color=TEXT_TITLE)
 
         # Update audio track dropdown
         if tracks:
